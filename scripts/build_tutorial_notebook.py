@@ -28,13 +28,9 @@ CIFAR-100을 학습한 작은 CNN(~71%)과, 각 레이어에 붙인 **희소 오
 
 code("""
 # ---- 셋업 ----
-# 기본(학생 배포용): 공개 튜토리얼 repo를 clone (슬림 코드 + 산출물 번들이 모두 커밋돼 있어 따로 받을 것 없음).
-# 테스트(GitHub 불필요): TEST_MODE = True 로 두고, cifar_speclens_edu.tar.gz 를 이 Colab 세션에 업로드.
+# 공개 repo 하나만 clone하면 끝 — 코드 + 산출물 + CIFAR가 전부 repo 안에 있어 외부 다운로드(느린 토론토 서버) 없음.
 import os, sys
-TEST_MODE = False
-if TEST_MODE and not os.path.isdir("SpecLens"):
-    !tar xzf cifar_speclens_edu.tar.gz
-elif not TEST_MODE and not os.path.isdir("SpecLens"):
+if not os.path.isdir("SpecLens"):
     !git clone -q --depth 1 https://github.com/Sangyu-Han/speclens-tutorial.git SpecLens
 %cd SpecLens
 sys.path.insert(0, ".")
@@ -42,9 +38,13 @@ sys.path.insert(0, ".")
 ART = "cifar_tutorial_artifacts"
 if not os.path.isdir(ART):
     !tar xzf cifar_tutorial_artifacts.tar.gz
+# CIFAR-100: repo에 동봉된 split 사본을 합쳐 ./data 로 풀기 (torchvision 기본 서버가 매우 느려서 우회)
+if os.path.isdir("cifar_data") and not os.path.isdir("data/cifar-100-python"):
+    os.makedirs("data", exist_ok=True)
+    !cat cifar_data/cifar-100-python.tar.gz.part-* > data/_c.tgz && tar xzf data/_c.tgz -C data && rm data/_c.tgz
 import torch
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print("device:", DEVICE, "| 산출물:", sorted(os.listdir(ART)))
+print("device:", DEVICE, "| 산출물:", sorted(os.listdir(ART)), "| CIFAR:", os.path.isdir("data/cifar-100-python"))
 """)
 
 md("## 1. 모델과 SAE feature\nCNN을 불러와 정확도를 확인하고, layer4의 SAE feature 하나가 무엇을 검출하는지(가장 강하게 반응한 이미지들) 봅니다.")

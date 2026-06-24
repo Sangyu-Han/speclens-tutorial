@@ -35,6 +35,14 @@ if not os.path.isdir("SpecLens"):
 %cd SpecLens
 sys.path.insert(0, ".")
 !pip -q install timm pyyaml pyarrow 2>/dev/null
+# 한글 폰트 (matplotlib 그래프의 한국어 표시 — 없으면 □로 깨짐)
+!apt-get -qq install -y fonts-nanum >/dev/null 2>&1
+import matplotlib.pyplot as plt, matplotlib.font_manager as fm
+try:
+    fm.fontManager.addfont("/usr/share/fonts/truetype/nanum/NanumGothic.ttf")
+    plt.rcParams["font.family"] = "NanumGothic"
+except Exception: pass
+plt.rcParams["axes.unicode_minus"] = False
 ART = "cifar_tutorial_artifacts"
 if not os.path.isdir(ART):
     !tar xzf cifar_tutorial_artifacts.tar.gz

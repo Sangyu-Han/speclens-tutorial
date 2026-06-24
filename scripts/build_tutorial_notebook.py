@@ -103,8 +103,8 @@ md("""
 ## 2. Mechanistic tree (기계론적 트리)
 클래스에서 출발해 위에서 아래로(top-down) 만든 트리: 각 레이어의 어떤 feature들이 그 클래스의 핵심
 feature를 구성하는지 보여줍니다(엣지 = FRI attribution, feature 공간의 insertion/deletion으로 검증됨).
-**완전한 인터랙티브** 버전은 `cifar_tutorial_artifacts/tree/motorcycle/tree.html` 입니다(다운받아 로컬에서
-열기: 노드 클릭 → 샘플 5개 + 활성화맵 + ERF, 그리고 무엇으로 *구성됐는지*). 노드 몇 개를 인라인으로:
+**완전한 인터랙티브** 버전(`tree/motorcycle/tree.html`)은 **맨 아래 셀에서 Colab 안에 바로** 띄웁니다
+(노드 클릭 → 샘플 5개 + 활성화맵 + ERF, "구성됐는지"로 드릴다운). 먼저 핵심 노드 몇 개를 인라인으로:
 """)
 
 code("""
@@ -116,6 +116,24 @@ for f in ["L4_f731", "L3_f557", "L3_f690"]:
         print(f); display(Image(p, width=560))
 # f731 = 'motorcycle' feature; 기여 feature로 f557(빨간 차체), f690(둥근/곡선 -> 바퀴) 등이 있음
 """)
+
+md("""
+**전체 인터랙티브 트리 — Colab 안에서 바로.** 아래 셀이 작은 웹서버로 트리를 띄웁니다. 노드를 클릭하면
+우측 패널에 그 feature의 5개 샘플 + 활성화맵 + ERF가 뜨고, "composed of"로 더 깊이 내려갑니다. (학생도 동일하게 봅니다.)
+""")
+
+code('''
+# 인터랙티브 트리 HTML 을 Colab 셀 안에 띄우기 (노드 클릭 -> 드릴다운).
+# 상대경로(nodes/, details/)는 작은 웹서버가 해결해 줍니다.
+import http.server, socketserver, threading, functools
+from google.colab import output
+TREE_DIR = f"{ART}/tree/motorcycle"
+_handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=TREE_DIR)
+_httpd = socketserver.TCPServer(("", 0), _handler)          # 빈 포트 자동 할당
+_port = _httpd.server_address[1]
+threading.Thread(target=_httpd.serve_forever, daemon=True).start()
+output.serve_kernel_port_as_iframe(_port, path="/tree.html", height=780)
+''')
 
 md("""
 ## 3. 오분류 디버깅

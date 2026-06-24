@@ -35,14 +35,6 @@ if not os.path.isdir("SpecLens"):
 %cd SpecLens
 sys.path.insert(0, ".")
 !pip -q install timm pyyaml pyarrow 2>/dev/null
-# 한글 폰트 (matplotlib 그래프의 한국어 표시 — 없으면 □로 깨짐)
-!apt-get -qq install -y fonts-nanum >/dev/null 2>&1
-import matplotlib.pyplot as plt, matplotlib.font_manager as fm
-try:
-    fm.fontManager.addfont("/usr/share/fonts/truetype/nanum/NanumGothic.ttf")
-    plt.rcParams["font.family"] = "NanumGothic"
-except Exception: pass
-plt.rcParams["axes.unicode_minus"] = False
 ART = "cifar_tutorial_artifacts"
 if not os.path.isdir(ART):
     !tar xzf cifar_tutorial_artifacts.tar.gz
@@ -104,7 +96,7 @@ acts = torch.cat(acts); top = [idxs[i] for i in acts.argsort(descending=True)[:8
 fig, ax = plt.subplots(1, 8, figsize=(12, 1.7))
 for a, i in zip(ax, top):
     a.imshow(train_raw.data[i]); a.axis("off"); a.set_title(classes[train_raw.targets[i]][:9], fontsize=7)
-fig.suptitle(f"layer4 feature {FEATURE}: 가장 강하게 반응한 이미지들"); plt.show()
+fig.suptitle(f"layer4 feature {FEATURE}: top-activating images"); plt.show()
 """)
 
 md("""

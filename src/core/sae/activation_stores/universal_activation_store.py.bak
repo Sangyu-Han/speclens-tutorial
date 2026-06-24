@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Universal Activation Store with Factory Pattern
+
+- 모델 아키텍처 무관: Adapter만 주면 어떤 PyTorch 모델에도 사용 가능
+- Hook discovery: 리스트/튜플/딕셔너리 출력까지 재귀적으로 훅 확장
+- Block-based CPU Queue: vLLM 페이지드 캐시 철학 적용(고정 토큰 블록 단위로 적재/스필)
+- Multi-GPU owner_stream: 레이어별 오너 GPU에만 청크 스트리밍(P2P send/recv)
+- Dynamic chunking by memory: 남은 GPU 메모리/용량(MB) 기준으로 전송 청크 크기 자동 튜닝
+- Adaptive collect: 결핍량에 따라 collect_round의 forward 횟수 자동 조정
+- owner_only / all: 수집 정책(통신량 vs 토큰/초 트레이드오프)
+"""
+from __future__ import annotations
+import os, gc, logging
+from pathlib import Path
+from typing import Dict, List, Optional, Union, Any, Callable, Tuple
+from collections import deque, defaultdict
+from contextlib import nullcontext
+# 맨 위 import 섹션 근처
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # PyTorch 2.x: "high" 권장 (cublasLt 경로가 더 안정적인 경우가 많음)
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+from src.core.hooks.spec import walk_tensors, SEP, parse_spec, METHOD_SEP
+from .hook_helper import (
+    to_2d_tokens,
+    copy_gpu_to_cpu_in_chunks,
+    coalesce_if_needed, to_pinned_cpu
+)
+logger = logging.getLogger(__name__)
+
+from src.utils.utils import stable_u64, resolve_module
+# ============================== #
+#   Block-based CPU Token Queue  #
+# ============================== #
+
+# === Deterministic stride phase =================================
+def compute_stride_phase(seed: int, layer_id: str, sample_id: int,
+                         epoch_idx: int, stride_step: int) -> int:
+    base = stable_u64(f"{seed}|{layer_id}|{sample_id}") % max(1, stride_step)
+    return (base + max(0, epoch_idx)) % max(1, stride_step)
+
+class TokenBlockQueue:
+    """
+    vLLM의 KV 블록처럼, 고정 토큰 수(block_size_tokens) 블록으로 관리하는 큐.
+    - push(t): 텐서를 블록 경계에 맞춰 잘라 블록 리스트에 append
+    - pop_batch(B): 블록에서 최대 B토큰까지 꺼내 concat (블록 경계 고려)
+    - spill/load 지원(옵션)
+    * 모든 텐서는 CPU에 존재합니다. (수신 직후 pinned CPU로 내린 뒤 push 권장)
+    """
+    def __init__(self, block_size_tokens: int, spill_dir: Optional[Path] = None,
+                 in_memory_blocks_cap: Optional[int] = None, lname: str = "",
+                 allow_gpu: bool = False):
+        self.block = int(block_size_tokens)
+        self.blocks: deque[torch.Tensor] = deque()   # CPU 텐서(필요시 pinned로 push 가능)
+        self.ntoks = 0
+        self.spill_dir = Path(spill_dir) if spill_dir else None
+        self.cap_blocks = in_memory_blocks_cap
+        self.lname = lname.replace("/", "_")
+        self.allow_gpu = bool(allow_gpu)
+        if self.spill_dir:
+            self.spill_dir.mkdir(parents=True, exist_ok=True)
+        self._spill_counter = 0  # 스필 파일 인덱싱
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def _maybe_spill(self):
+        if not self.spill_dir or self.cap_blocks is None:
+            return
+        while len(self.blocks) > self.cap_blocks:
+            blk = self.blocks.popleft()
+            self.ntoks -= blk.shape[0]
+            idx = self._spill_counter
+            torch.save(blk, self.spill_dir / f"{self.lname}.blk.{idx:08d}.pt")
+            self._spill_counter += 1
+            del blk
+
+    def _maybe_load(self) -> bool:
+        # pop 시 RAM이 비어있고 스필 파일이 있으면 하나 로드
+        if not self.spill_dir:
+            return False
+        files = sorted(self.spill_dir.glob(f"{self.lname}.blk.*.pt"))
+        if not files:
+            return False
+        f = files[0]
+        blk = torch.load(f, map_location="cpu")
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+        self.blocks.append(blk)
+        self.ntoks += blk.shape[0]
+        return True
+    
+    def push(self, t: torch.Tensor):
+        if t is None or t.numel() == 0:
+            return
+        if not self.allow_gpu:
+            assert t.device.type == "cpu", "TokenBlockQueue expects CPU tensors"
+        N = t.shape[0]
+        i = 0
+        while i < N:
+            j = min(N, i + self.block)
+            # contiguous CPU (pinned여부는 push 이전 단계에서 확보 권장)
+            self.blocks.append(t[i:j].contiguous())
+            self.ntoks += (j - i)
+            i = j
+        self._maybe_spill()
+
+    def pop_batch(self, batch_size: int) -> Optional[torch.Tensor]:
+        if self.ntoks < batch_size:
+            # 스필된 게 있다면 하나 로드해본다
+            loaded = self._maybe_load()
+            if not loaded and self.ntoks < batch_size:
+                return None
+        out_chunks = []
+        need = batch_size
+        while need > 0 and self.blocks:
+            blk = self.blocks[0]
+            if blk.shape[0] <= need:
+                out_chunks.append(blk)
+                need -= blk.shape[0]
+                self.blocks.popleft()
+                self.ntoks -= blk.shape[0]
+            else:
+                out_chunks.append(blk[:need])
+                self.blocks[0] = blk[need:].contiguous()
+                self.ntoks -= need
+                need = 0
+        if not out_chunks:
+            return None
+        return torch.cat(out_chunks, dim=0)
+
+    def __repr__(self) -> str:
+        spill = str(self.spill_dir) if self.spill_dir is not None else None
+        return (
+            "TokenBlockQueue("
+            f"block={self.block}, tokens={self.ntoks}, blocks={len(self.blocks)}, "
+            f"spill_dir={spill}, spilled={self._spill_counter})"
+        )
+
+
+# ============================== #
+#         Core Store Class       #
+# ============================== #
+
+class UniversalActivationStore:
+    """
+    범용 Activation Store
+    - 어떤 모델이든 Adapter를 통해 입력/forward/콜레이트를 위임
+    - 레이어 훅 포인트를 기준으로 활성값을 수집→CPU 블록 큐에 적재
+    - DDP + owner_stream으로 레이어 오너 rank에만 청크 스트리밍
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: Dict,
+        adapter: "ModelAdapter",
+        dataset=None,
+        sampler=None,
+        on_batch_generated: Optional[Callable[[Any], None]] = None,
+    ):
+        self.model = model
+        self.adapter = adapter
+        self.dataset = dataset
+        self.sampler = sampler
+        self.on_batch_generated = on_batch_generated # 콜백 저장
+        self.cfg = cfg or {}
+        
+        # === provenance schema (adapter-provided) ===
+        spec = self.adapter.get_provenance_spec() 
+        cols = tuple(spec.get("cols") or ("sample_id","frame_idx","y","x"))
+        num_cols = int(spec.get("num_cols") or len(cols))
+        self.prov_cols = cols
+        self.prov_num_cols = num_cols        
+
+        # --- 기본 설정 ---
+        self.device = torch.device(self.cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+        self.hook_points = self.cfg.get("hook_points") or adapter.get_hook_points()
+        self.model_batch_size = int(self.cfg.get("model_batch_size", 4))
+        self.num_batches_in_buffer = int(self.cfg.get("num_batches_in_buffer", 4))
+        self.buffer_on_cpu = bool(self.cfg.get("buffer_on_cpu", True))
+        self.activation_batch_size = int(self.cfg.get("batch_size", 4096))
+
+        # --- per-layer/defaults ---
+        self.per_layer = self.cfg.get("per_layer", {}) or {}
+        collector = self.cfg.get("collector", {}) or {}
+        self.low_watermark = int(collector.get("low_watermark_tokens", self.activation_batch_size))
+        self.high_watermark = int(collector.get("high_watermark_tokens", 4 * self.activation_batch_size))
+        self.defaults = self.cfg.get("defaults", {
+            "batch_size": self.activation_batch_size,
+            "low": self.low_watermark,
+            "high": self.high_watermark,
+            "stride": 1,
+        })
+
+        # --- queue 설정 ---
+        qcfg = self.cfg.get("queue", {}) or {}
+        self.block_size_tokens = int(qcfg.get("block_size_tokens", 16384))
+        self.in_memory_blocks_per_layer = qcfg.get("in_memory_blocks_per_layer", None)
+        self.spill_to_disk = bool(qcfg.get("spill_to_disk", False))
+        self.spill_dir = Path(qcfg.get("spill_dir", "outputs/sae_spill"))
+
+        # --- sync/전송 설정 ---
+        sync_cfg = self.cfg.get("sync", {}) or {}
+        self.sync_mode = sync_cfg.get("mode", "all_gather")   # 'owner_stream' | 'none' | 'all_gather'
+
+        tx = str(sync_cfg.get("transfer_dtype", "float32")).lower()
+        self.transfer_dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}.get(tx, torch.float32)
+
+        self.dynamic_chunking = bool(sync_cfg.get("dynamic_chunking", False))
+        self.chunk_bytes = int(sync_cfg.get("chunk_mb", 16) * 1024 * 1024)  # fallback
+        self.min_chunk_tokens = int(sync_cfg.get("min_chunk_tokens", 8192))
+        self.max_chunk_tokens = int(sync_cfg.get("max_chunk_tokens", 262144))
+        self.target_free_frac = float(sync_cfg.get("target_free_frac", 0.6))
+        self.safety_bytes = int(sync_cfg.get("safety_mb", 256) * 1024 * 1024)
+        self.max_chunk_bytes = int(sync_cfg.get("max_chunk_mb", 64) * 1024 * 1024)
+        self.min_chunk_bytes = int(sync_cfg.get("min_chunk_mb", 4) * 1024 * 1024)
+        self._recv_buf_cache = {}  # (layer_name, src_rank) -> GPU 텐서
+        self.collect_policy = sync_cfg.get("collect_policy", "all")  # 'all' | 'owner_only'
+        self.layer_owners: Dict[str, int] = {}
+
+        # --- adaptive collect ---
+        tcfg = (self.cfg.get("training") or {})
+        self.adaptive_collect = bool(tcfg.get("adaptive_collect", True))
+        self.max_collect_batches_per_round = int(self.cfg.get("collector", {}).get("max_collect_batches_per_round",
+                                                                                   tcfg.get("max_collect_batches_per_round", 4)))
+        self.min_collect_batches_per_round = int(tcfg.get("min_collect_batches_per_round", 1))
+
+        # --- 런타임 상태 ---
+        self.hooks = {}
+        self.activations: Dict[str, List[torch.Tensor]] = {hp: [] for hp in self.hook_points}
+        self.act_sizes: Dict[str, int] = {}
+        self.expanded_hook_points: List[str] = list(self.hook_points) # 대부분의 경우 expanded_hook_points만 사용. 
+        # __init__ 맨 아래 쪽, self.expanded_hook_points 정의 근처에 추가
+        self._base_to_targets: Dict[str, set[str]] = {}  # base 모듈명 -> 최종 수집 타깃(확장된 경로) 집합
+
+        from threading import Lock
+        self._pair_locks = {lname: Lock() for lname in self.expanded_hook_points}
+        self.queues: Dict[str, TokenBlockQueue] = {}
+        # === provenance on/off ===
+        prov_cfg = (self.cfg.get("provenance") or {})
+        self.enable_provenance = bool(prov_cfg.get("enabled", False))
+        self.prov_queues: Dict[str, TokenBlockQueue] = {}
+        # 훅에서 CPU 조각 누적용
+        self._prov_accum: Dict[str, list[torch.Tensor]] = {hp: [] for hp in self.hook_points}
+
+        # ✅ 디버깅용: 큐 토큰 '초기' 및 '피크' 기록
+        self.queue_init_tokens = defaultdict(int)  # 최초 비-0이 된 시점의 토큰 수
+        self.queue_peak_tokens = defaultdict(int)  # 관측된 최대 토큰 수
+        
+        self._first_run_done = False
+        self._in_discovery = False
+        self.collect_targets: set[str] = set()
+        self._pending_copy_events: list = []
+
+        # dataloader
+        self._epoch = 0
+        self.loader: Optional[DataLoader] = None
+        self.dataset_iter = None
+        self._batches_in_epoch = 0  # 현재 epoch 내 소비한 미니배치 수
+        self._resume_target = None  # {"epoch": int, "b_in_epoch": int} (선택)
+
+        # 로그
+        logger.info("UniversalActivationStore initialized")
+        logger.info(f"  device={self.device} model_batch_size={self.model_batch_size} buffer_batches={self.num_batches_in_buffer}")
+        logger.info(f"  hook_points={self.hook_points}")
+
+        # hook 등록
+        self._register_hooks()
+        self._pair_locks = {lname: Lock() for lname in self.expanded_hook_points}
+        self.strict_provenance = bool(prov_cfg.get("strict", True))  # 기본 True 권장
+        self._freeze_owner_layers = False
+        
+        rs = (self.cfg.get("random_stride") or {})
+        self.rs_enabled = bool(rs.get("enabled", True))
+        self.rs_seed    = int(rs.get("seed", 0))
+        self.rs_mode    = str(rs.get("mode", "phase_cycling"))  # 보관용
+        self.rs_axis    = str(rs.get("axis", "linear"))         # 확장 여지
+
+        self.sync_meta_across_ranks = bool(prov_cfg.get("sync_meta_across_ranks", False))
+
+    # ---------- 설정 유틸 ----------
+    def set_freeze_owner_layers(self, on: bool):
+        self._freeze_owner_layers = bool(on)
+
+    def __repr__(self) -> str:
+        return (
+            "UniversalActivationStore("
+            f"device={self.device}, hook_points={len(self.hook_points)}, "
+            f"expanded_hooks={len(self.expanded_hook_points)}, queues={len(self.queues)}, "
+            f"sync_mode='{self.sync_mode}', collect_policy='{self.collect_policy}', "
+            f"provenance_enabled={self.enable_provenance}, "
+            f"dataset={'set' if self.dataset is not None else 'none'})"
+        )
+        
+    def _cfg_for_layer(self, lname: str) -> Dict[str, Any]:
+        if lname in self.per_layer:
+            return {**self.defaults, **self.per_layer[lname]}
+        for k, v in self.per_layer.items():
+            if lname.startswith(k + SEP) or lname.startswith(k):
+                return {**self.defaults, **v}
+        return self.defaults
+
+    def set_layer_owners(self, owners: Dict[str, int]):
+        """레이어 이름 -> 오너 rank 매핑 주입 (전 rank 동일하게 호출)"""
+        self.layer_owners = owners or {}
+    # ---------- helpers ----------
+    def _empty_prov(self, n: int = 0) -> torch.Tensor:
+        return torch.empty(n, self.prov_num_cols, dtype=torch.long)
+    
+    def _expand_hook_points_via_probe(self, *, tmp_bs: int = 1, tmp_nf: int = 2, use_amp: bool = True):
+        collected: Dict[str, list[tuple[str, int]]] = defaultdict(list)  # probe_prefix -> [(full_name, C)]
+        handles = []
+        wrapped_methods: List[Tuple[object, str, object]] = []  # (module, method_name, orig)
+        alias_map: Dict[str, str] = {}  # physical_full_name -> alias_full_name
+
+        # 0) 스펙 분해/그룹화
+        mod_groups: Dict[str, List[str]] = {}                # base -> [physical targets]
+        meth_groups: Dict[Tuple[str,str], List[str]] = {}    # (base, method) -> [physical targets]
+        alias_for_prefix: Dict[str, str] = {}                # physical_prefix -> alias_prefix
+
+        for spec in self.hook_points:
+            base, method, branch, alias, _attr = parse_spec(spec)
+            if method is None:
+                # 모듈
+                physical_prefix = base
+                target = f"{base}{SEP}{branch}" if branch is not None else base
+                mod_groups.setdefault(base, []).append(target)
+            else:
+                physical_prefix = f"{base}{METHOD_SEP}{method}"
+                target = f"{physical_prefix}{SEP}{branch}" if branch is not None else physical_prefix
+                meth_groups.setdefault((base, method), []).append(target)
+
+            if alias:
+                # alias 는 prefix 치환 규칙 사용
+                alias_for_prefix[physical_prefix] = alias
+
+        # 1) 모듈 훅
+        def make_tmp_hook(base_name: str, targets: List[str]):
+            def _fn(module, inputs, output):
+                pairs = walk_tensors(base_name, output, allowed_prefixes=targets)
+                for name, ten in pairs:
+                    t2 = to_2d_tokens(ten)
+                    if t2 is not None:
+                        collected[base_name].append((name, int(t2.shape[-1])))
+            return _fn
+
+        for base, targets in mod_groups.items():
+            try: m = self._get_module_by_name(base)
+            except AttributeError:
+                logger.warning(f"[expand] base not found: {base} (skip)")
+                continue
+            handles.append(m.register_forward_hook(make_tmp_hook(base, targets)))
+
+        # 2) 메서드 래핑
+        import types
+        def make_tmp_wrapper(probe_prefix: str, targets: List[str], module, method_name: str, orig):
+            def _wrapped(self_obj, *args, **kwargs):
+                out = orig(self_obj, *args, **kwargs)
+                pairs = walk_tensors(probe_prefix, out, allowed_prefixes=targets)
+                for name, ten in pairs:
+                    t2 = to_2d_tokens(ten)
+                    if t2 is not None:
+                        collected[probe_prefix].append((name, int(t2.shape[-1])))
+                return out
+            return types.MethodType(_wrapped, module)
+
+        for (base, method), targets in meth_groups.items():
+            probe_prefix = f"{base}{METHOD_SEP}{method}"
+            try: m = self._get_module_by_name(base)
+            except AttributeError:
+                logger.warning(f"[expand] base not found: {base}{METHOD_SEP}{method} (skip)")
+                continue
+            if not hasattr(m, method):
+                logger.warning(f"[expand] method missing: {base}{METHOD_SEP}{method} (skip)")
+                continue
+            orig = getattr(m, method)
+            wrapped = make_tmp_wrapper(probe_prefix, targets, m, method, orig.__func__ if hasattr(orig, "__func__") else orig)
+            setattr(m, method, wrapped)
+            wrapped_methods.append((m, method, orig))
+
+        # 3) 1회 실행
+        ran = False
+        try:
+            amp = torch.amp.autocast("cuda", dtype=torch.bfloat16) if (use_amp and torch.cuda.is_available()) else nullcontext()
+            with torch.no_grad(), amp:
+                if self.dataset is not None:
+                    old_bs = self.model_batch_size
+                    old_nf = getattr(self.sampler, "num_frames", None)
+                    try:
+                        self.model_batch_size = max(1, tmp_bs)
+                        if old_nf is not None: self.sampler.num_frames = max(1, min(old_nf, tmp_nf))
+                        tmp_loader = self._create_streaming_dataloader()
+                        batch = next(iter(tmp_loader))
+                        self._run_model_on_batch(batch)
+                        ran = True
+                    finally:
+                        self.model_batch_size = old_bs
+                        if old_nf is not None: self.sampler.num_frames = old_nf
+                elif hasattr(self.adapter, "create_dummy_input"):
+                    try:
+                        dummy = self.adapter.create_dummy_input(max(1, tmp_bs), self.device)
+                        prepped = self.adapter.preprocess_input(dummy)
+                        self.adapter.forward(prepped)
+                        ran = True
+                    except Exception:
+                        pass
+        finally:
+            for h in handles:
+                try: h.remove()
+                except Exception: pass
+            for m, method_name, orig in wrapped_methods:
+                try: setattr(m, method_name, orig)
+                except Exception: pass
+
+        if not ran:
+            logger.warning("[expand] probe skipped; fallback to bases only.")
+            bases = sorted(set(parse_spec(p)[0] for p in self.hook_points))
+            self.expanded_hook_points = list(bases)
+            self._base_to_targets = {b: set([b]) for b in bases}
+            return
+
+        # 4) 부모 제거 + alias 치환 + 캐시
+        expanded = []
+        base_to_targets: Dict[str, set[str]] = {}
+        for probe_prefix, items in collected.items():
+            names = [n for (n, _) in items]
+            # 부모 제거
+            s = set(names)
+            keep = [n for n in names if not any((m != n) and m.startswith(n + SEP) for m in s)]
+
+            # alias 치환(있다면)
+            alias_prefix = alias_for_prefix.get(probe_prefix, None)
+            if alias_prefix:
+                keep_alias = [ alias_prefix + n[len(probe_prefix):] for n in keep ]
+                expanded.extend(keep_alias)
+                base_to_targets[probe_prefix] = set(keep_alias)
+                # act_sizes: 물리/별칭 둘 다 채워두면 편함
+                for (n, dim) in items:
+                    self.act_sizes[n] = int(dim)
+                    self.act_sizes[alias_prefix + n[len(probe_prefix):]] = int(dim)
+            else:
+                expanded.extend(keep)
+                base_to_targets[probe_prefix] = set(keep)
+                for (n, dim) in items:
+                    self.act_sizes[n] = int(dim)
+
+        self.expanded_hook_points = sorted(set(expanded))
+        self._base_to_targets = base_to_targets
+        logger.info(f"[expand] expanded_hook_points={len(self.expanded_hook_points)}")
+    
+    def _append_cpu_activation(self, lname: str, t: torch.Tensor):
+        # 항상 CPU로 강제 통일 + dtype/contiguous 정리
+        if t.device.type != "cpu":
+            t = t.detach().to("cpu", non_blocking=False, copy=True)
+        t = t.contiguous()
+        self.activations[lname].append(t)
+        
+    def _update_queue_counters(self, lname: str):
+        """큐에 push된 직후 호출: init/peak 토큰 수 업데이트."""
+        q = self.queues.get(lname)
+        if q is None:
+            return
+        cur = int(q.ntoks)
+        if self.queue_init_tokens[lname] == 0 and cur > 0:
+            self.queue_init_tokens[lname] = cur
+        if cur > self.queue_peak_tokens[lname]:
+            self.queue_peak_tokens[lname] = cur
+
+    def get_buffer_progress(self) -> Dict[str, Dict[str, int]]:
+        """
+        각 레이어별 큐 상태를 반환:
+        { lname: {"current": int, "init": int, "peak": int, "low": int, "high": int, "batch_size": int} }
+        """
+        out: Dict[str, Dict[str, int]] = {}
+        for lname, q in self.queues.items():
+            cfg = self._cfg_for_layer(lname)
+            out[lname] = {
+                "current": int(q.ntoks),
+                "init":    int(self.queue_init_tokens.get(lname, 0)),
+                "peak":    int(self.queue_peak_tokens.get(lname, 0)),
+                "low":     int(cfg.get("low",  self.low_watermark)),
+                "high":    int(cfg.get("high", self.high_watermark)),
+                "batch_size": int(cfg.get("batch_size", self.activation_batch_size)),
+            }
+        return out
+    def get_loader_position(self):
+        return {"epoch": int(self._epoch), "b_in_epoch": int(self._batches_in_epoch)}
+
+    def _next_batch_from_loader(self):
+        self._ensure_loader()
+        try:
+            batch = next(self.dataset_iter)
+            self._batches_in_epoch += 1
+            return batch
+        except StopIteration:
+            self._epoch += 1
+            if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+                self.sampler.set_epoch(self._epoch)
+            self.dataset_iter = iter(self.loader)
+            self._batches_in_epoch = 0
+            batch = next(self.dataset_iter)
+            self._batches_in_epoch += 1
+            return batch
+    # ---------- dataloader ----------
+    def fast_forward_loader(self, *, epoch: int, b_in_epoch: int):
+        """모델 forward 없이 DataLoader만 소비해서 커서를 (epoch, b_in_epoch)까지 맞춘다."""
+        # 새 loader/iter 새로고침
+        self.loader = self._create_streaming_dataloader()
+        self.dataset_iter = iter(self.loader)
+        self._epoch = 0
+        self._batches_in_epoch = 0
+        if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(0)
+
+        # epoch 단위로 넘기기
+        while self._epoch < epoch:
+            try:
+                # 이 epoch 끝까지 소비
+                while True:
+                    next(self.dataset_iter)
+            except StopIteration:
+                self._epoch += 1
+                if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+                    self.sampler.set_epoch(self._epoch)
+                self.dataset_iter = iter(self.loader)
+                self._batches_in_epoch = 0
+
+        # 해당 epoch 내에서 b_in_epoch 만큼 소비
+        for _ in range(b_in_epoch):
+            next(self.dataset_iter)
+            self._batches_in_epoch += 1
+
+    def _ensure_loader(self):
+        if self.loader is None or self.dataset_iter is None:
+            self.loader = self._create_streaming_dataloader()
+            self.dataset_iter = iter(self.loader)
+            self._epoch = 0
+            self._batches_in_epoch = 0
+
+    def _create_streaming_dataloader(self, *, num_workers_override: Optional[int] = None) -> DataLoader:
+        pin = (getattr(self.adapter, "device", torch.device("cpu")).type == "cuda")
+        num_workers = int(self.cfg.get("num_workers", 0) if num_workers_override is None else num_workers_override) # num_workers 가 0보다 클때 지금 에러남.
+        kwargs = dict(
+            dataset=self.dataset,
+            batch_size=self.model_batch_size,
+            shuffle=(self.sampler is None),
+            sampler=self.sampler,
+            num_workers=num_workers,
+            pin_memory=pin,
+            drop_last=True,
+            persistent_workers=(num_workers > 0),  # ← 추가
+            
+        )
+        # if num_workers > 0:
+        #     kwargs["prefetch_factor"] = int(self.cfg.get("prefetch_factor", 2))
+        collate_fn = getattr(self.adapter, "collate_fn", None)
+        if collate_fn is not None:
+            kwargs["collate_fn"] = collate_fn
+        return DataLoader(**kwargs)
+
+    # ---------- hook 등록 ----------
+
+    def _get_module_by_name(self, name: str) -> nn.Module:
+        module = self.model
+        if isinstance(module, torch.nn.parallel.distributed.DistributedDataParallel):
+            module = module.module
+        try:
+            return resolve_module(module, name)
+        except AttributeError:
+            raise AttributeError(f"Module '{name}' not found (after resolving against root model)")
+
+    def _register_hooks(self):
+        self.handles = []
+        registered = []
+
+        # base -> targets 집합이 없으면 한 번 만들어 둠(가능하면 프로브)
+        if not self._base_to_targets:
+            try:
+                self._expand_hook_points_via_probe()
+            except Exception as e:
+                logger.warning(f"[hook] expand via probe failed: {e}")
+
+            # 그래도 비었으면 최소 base만 타깃으로
+            if not self._base_to_targets:
+                groups: Dict[str, List[str]] = {}
+                for p in self.hook_points:
+                    base = p.split(SEP)[0]
+                    groups.setdefault(base, []).append(p)
+                self._base_to_targets = {b: set(ts) for b, ts in groups.items()}
+                self.expanded_hook_points = sorted({t for ts in self._base_to_targets.values() for t in ts})
+
+        def make_hook(b_name: str, targets: set[str]):
+            def hook_fn(module, inputs, output):
+                # 평탄화
+                pairs = walk_tensors(b_name, output, allowed_prefixes=targets)
+                my_rank = (dist.get_rank() if (dist.is_initialized() and dist.get_world_size() > 1) else 0)
+
+                for act_name, ten in pairs: # pairs 한번 확인해보자. 어떤 쌍이 있는지.. 생각해보니 SEP으로 walk 된 애들만 있어야함. 모듈의 fidx도 한번 조회해보자.
+                    if act_name not in targets and not any(act_name.startswith(t + SEP) for t in targets):
+                        continue
+                    # --- owner-layer freeze: 로컬 대기 중이면 '내 오너' 타깃만 건너뜀 ---
+                    if (not self._in_discovery) and self._freeze_owner_layers and self.layer_owners:
+                        owner = self.layer_owners.get(act_name, None)  # ← 기본값 None으로 (모르면 스킵하지 않음)
+                        if owner is not None and owner == my_rank:
+                            continue  # freeze한 내 owner 레이어는 수집하지 않음. 다른 gpu의 레이어만 수집해서 전송
+                    t2d = to_2d_tokens(ten) # (N, C). C차원 벡터들을 모아 batch로 들어갈거임. provenance는 이 각각의 C차원 벡터의 기원을 저장하는 벡터이므로, (N,col)
+                    if t2d is None:
+                        logger.warning(f"[hook] Unexpected activation shape for {act_name}: {tuple(ten.shape)}")
+                        continue
+
+                    # per-layer stride 설정
+                    cfg_l = self._cfg_for_layer(act_name)
+                    stride = int(cfg_l.get("stride", 1))
+
+                    # (A) 전체 토큰 기준 provenance 먼저 생성(= stride 미적용)
+                    prov_full = None
+                    fidx_hint = getattr(self.adapter, "current_frame_idx", lambda: -1)()
+                    if self.enable_provenance:
+                        prov_full = self.adapter.build_token_provenance(
+                            act_name=act_name,
+                            raw_output=ten,
+                            flattened_tokens=t2d,
+                            fidx_hint=fidx_hint,
+                         )
+                        if self.enable_provenance and self.strict_provenance and prov_full is not None:
+                            assert prov_full.shape[0] == t2d.shape[0], \
+                                f"[hook:{act_name}] act/prov size mismatch before stride: {t2d.shape[0]} vs {prov_full.shape[0]}"
+
+
+                    # (B) 결정적 랜덤 stride 선택(phase: seed/layer/sample/epoch)
+                    if stride > 1 and self.rs_enabled and (prov_full is not None):
+                        N = int(prov_full.shape[0])
+                        idx_cpu = torch.arange(N, dtype=torch.long, device='cpu')
+                        sids    = prov_full[:, 0].to(torch.long)                   #CPU
+
+                        # per-row phase (list comp: 빠르고 깔끔)
+                        phases = torch.as_tensor([
+                            compute_stride_phase(self.rs_seed, act_name, int(s), self._epoch, stride)
+                            for s in sids.tolist()
+                        ], dtype=torch.long)
+
+                        keep = ((idx_cpu - phases) % stride) == 0
+                        sel  = keep.nonzero(as_tuple=True)[0]                      # CPU index
+
+                        # act(prov) 동형 슬라이싱
+                        t2d   = t2d.index_select(0, sel.to(t2d.device, non_blocking=False))
+                        prov_full = prov_full.index_select(0, sel)
+                    elif stride > 1:
+                        # provenance가 꺼진 경우엔 에폭 기반 fallback(결정성 유지)
+                        # phase = (self._epoch % stride) if self.rs_enabled else 0
+                        # t2d, _ = apply_stride(t2d, stride, phase)
+                        N = int(t2d.shape[0])
+                        idx_cpu = torch.arange(N, dtype=torch.long, device='cpu')
+                        phases = torch.as_tensor([
+                            compute_stride_phase(self.rs_seed, act_name, i, self._epoch, stride)
+                            for i in idx_cpu.tolist()
+                        ], dtype=torch.long)
+                        
+                        keep = ((idx_cpu - phases) % stride) == 0
+                        sel  = keep.nonzero(as_tuple=True)[0]                      # CPU index
+
+                        # act(prov) 동형 슬라이싱
+                        t2d   = t2d.index_select(0, sel.to(t2d.device, non_blocking=False))
+                    # CPU 적재 (GPU면 청크 복사)
+                    if not self.buffer_on_cpu:
+                        # Keep activations on-device to avoid GPU↔CPU hops
+                        t_dev = t2d.detach().contiguous()
+                        if t_dev.dtype != self.transfer_dtype:
+                            t_dev = t_dev.to(self.transfer_dtype)
+                        self.activations[act_name].append(t_dev)
+                        if self.enable_provenance and prov_full is not None:
+                            self._prov_accum[act_name].append(prov_full)
+                    elif t2d.is_cuda:
+                        chunk_mb = int(self.cfg.get("queue", {}).get("hook_copy_chunk_mb", 8))
+                        copy_gpu_to_cpu_in_chunks(
+                            self, act_name, t2d, prov_full,
+                            chunk_mb=chunk_mb,
+                            transfer_dtype=self.transfer_dtype
+                        )
+                    else:
+                        cpu_t = t2d.detach().contiguous().to(dtype=self.transfer_dtype, device="cpu")
+                        self._append_cpu_activation(act_name, cpu_t)
+                        if self.enable_provenance and prov_full is not None:
+                            self._prov_accum[act_name].append(prov_full)
+
+                    # 조각 병합
+                    # thr = int(self.cfg.get("queue", {}).get("coalesce_threshold", 64))
+                    # coalesce_if_needed(self, act_name, thr)
+                return None
+            return hook_fn
+
+        for base, targets in self._base_to_targets.items():
+            try:
+                module = self._get_module_by_name(base)
+            except AttributeError:
+                logger.warning(f"[hook] Base module not found: {base} (skip)")
+                continue
+            h = module.register_forward_hook(make_hook(base, targets))
+            self.hooks[base] = h
+            registered.append(base)
+
+        if not registered:
+            logger.warning("[hook] No hooks were registered!")
+        else:
+            logger.info(f"[hook] Registered {len(registered)} base hooks.")
+
+
+    # ---------- discovery ----------
+
+    def discover_hook_points(self):
+        if self._first_run_done:
+            return
+        logger.info("[discover] Light discovery run...")
+
+        self._in_discovery = True
+        disc = self.cfg.get("discovery", {}) or {}
+        tmp_bs = max(1, int(disc.get("batch_size", 1)))
+        tmp_nf = int(disc.get("override_num_frames", 2))
+        use_amp = bool(disc.get("amp_bfloat16", True))
+
+        old_bs = self.model_batch_size
+        old_nf = None
+
+        try:
+            # sampler.num_frames 축소(가능 시)
+            if hasattr(self.sampler, "num_frames"):
+                old_nf = self.sampler.num_frames
+                self.sampler.num_frames = max(1, min(old_nf, tmp_nf))
+
+            # 임시 배치 한 번
+            self.model_batch_size = tmp_bs
+            tmp_loader = self._create_streaming_dataloader(num_workers_override=0)
+            tmp_iter = iter(tmp_loader)
+            batch = next(tmp_iter)
+
+            with torch.no_grad():
+                amp = torch.amp.autocast("cuda", dtype=torch.bfloat16) if (use_amp and torch.cuda.is_available()) else nullcontext()
+                with amp:
+                    self._run_model_on_batch(batch)
+
+            self._first_run_done = True
+
+        finally:
+            self._in_discovery = False
+            self.model_batch_size = old_bs
+            if old_nf is not None:
+                self.sampler.num_frames = old_nf
+            # 임시 누적 비우기
+            for k in list(self.activations.keys()):
+                self.activations[k] = []
+            for k in list(self._prov_accum.keys()):
+                self._prov_accum[k] = []
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # 본 실행용 iterator 리셋
+            # 본 실행용 iterator 리셋 (기존 loader 재생성 + 재사용)
+            self.loader = self._create_streaming_dataloader()
+            self.dataset_iter = iter(self.loader)
+            self._epoch = 0
+            if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+                self.sampler.set_epoch(self._epoch)
+
+
+            # === 여기서 레이어별 큐 생성(TokenBlockQueue) ===
+            for lname in sorted(self.expanded_hook_points):
+                if lname not in self.queues:
+                    cap_blocks = (int(self.in_memory_blocks_per_layer)
+                                  if self.in_memory_blocks_per_layer is not None else None)
+                    spill_here = (self.spill_dir if self.spill_to_disk else None)
+                    allow_gpu = not self.buffer_on_cpu
+                    self.queues[lname] = TokenBlockQueue(
+                        block_size_tokens=self.block_size_tokens,
+                        spill_dir=spill_here,
+                        in_memory_blocks_cap=cap_blocks,
+                        lname=lname,
+                        allow_gpu=allow_gpu,
+                    )
+                    # provenance queue (token-wise int64[*,4]) — 필요할 때만
+                    if self.enable_provenance and lname not in self.prov_queues:
+                        self.prov_queues[lname] = TokenBlockQueue(
+                            block_size_tokens=self.block_size_tokens,
+                            spill_dir=spill_here,
+                            in_memory_blocks_cap=cap_blocks,
+                            lname=f"{lname}__prov",
+                        )
+
+        logger.info(f"[discover] expanded hook points = {len(self.expanded_hook_points)}")
+
+    # ---------- 전송/플러시 헬퍼 ----------
+
+    @staticmethod
+    def _bytes_per_elem(dtype: torch.dtype) -> int:
+        return torch.tensor([], dtype=dtype).element_size()
+
+    def _tokens_per_chunk(self, act_dim: int) -> int:
+        """동적(메모리) 또는 정적(MB) 기준으로 전송 청크 토큰 수 산정."""
+        if act_dim <= 0:
+            return max(1, self.min_chunk_tokens)
+        if self.dynamic_chunking:
+            # 현재 남은 메모리 기반으로 예산 산정
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                with torch.cuda.device(torch.cuda.current_device()):
+                    free_bytes, _ = torch.cuda.mem_get_info()
+            else:
+                free_bytes = self.chunk_bytes
+            budget = max(0, int((free_bytes - self.safety_bytes) * self.target_free_frac))
+            budget = max(self.min_chunk_bytes, min(self.max_chunk_bytes, budget))
+        else:
+            budget = self.chunk_bytes
+
+        bpe = self._bytes_per_elem(self.transfer_dtype)
+        denom = max(1, act_dim * bpe)
+        tokens = max(1, budget // denom)
+        tokens = max(self.min_chunk_tokens, min(self.max_chunk_tokens, tokens))
+        return int(tokens)
+
+    @staticmethod
+    def _to_pinned_cpu(gpu_tensor: torch.Tensor) -> torch.Tensor:
+        """GPU→CPU 즉시 오프로딩 (pinned host)"""
+        cpu = torch.empty_like(gpu_tensor, device="cpu", pin_memory=True)
+        cpu.copy_(gpu_tensor, non_blocking=True)
+        return cpu
+
+    # ---------- flush (로컬/owner_stream/all_gather) ----------
+
+    def _flush_activations_to_queues(self):
+        # 싱글/비DDP/동기화 없음: 로컬만 push
+        # GPU 버퍼만 쓰는 경우에는 copy 이벤트가 없으니 동기화 스킵
+        if self.buffer_on_cpu and getattr(self, "_pending_copy_events", None):
+            self._ensure_copy_done()
+        for lname in sorted(self.expanded_hook_points):
+            acts = self.activations.get(lname, [])
+            thr = int(self.cfg.get("queue", {}).get("coalesce_threshold", 64))
+            if len(acts) >= thr:
+                coalesce_if_needed(self, lname, thr)
+        if not dist.is_initialized() or dist.get_world_size() <= 1 or self.sync_mode == "none":
+            for lname in sorted(self.expanded_hook_points):
+                acts = self.activations.get(lname, [])
+                provs = self._prov_accum.get(lname, []) if self.enable_provenance else []
+                if self.enable_provenance and self.strict_provenance:
+                    n_act  = sum(int(t.shape[0]) for t in acts)
+                    n_prov = sum(int(t.shape[0]) for t in provs)
+                    assert n_act == n_prov, \
+                        f"[flush:{lname}] act/prov rows mismatch before cat: {n_act} vs {n_prov}"
+                if acts:
+                    buf = torch.cat(acts, dim=0)
+                    if self.buffer_on_cpu:
+                        buf = buf.pin_memory()
+                    self.queues[lname].push(buf)
+                    if buf.numel():
+                        self.act_sizes[lname] = int(buf.shape[-1])
+                    self._update_queue_counters(lname)
+
+                if self.enable_provenance and provs:
+                    pbuf = torch.cat(provs, dim=0).contiguous()
+                    if self.strict_provenance:
+                        assert pbuf.shape[0] == self.queues[lname].ntoks, \
+                            f"[flush:{lname}] prov rows != queue tokens"
+                    self.prov_queues[lname].push(pbuf)
+
+                self.activations[lname] = []
+                if self.enable_provenance:
+                    self._prov_accum[lname] = []
+            # gc.collect()
+            # if torch.cuda.is_available(): torch.cuda.empty_cache()
+            return
+
+        # DDP 경로
+        world = dist.get_world_size()
+        rank = dist.get_rank()
+        device_index = torch.cuda.current_device() if torch.cuda.is_available() else None
+        device = torch.device(f"cuda:{device_index}") if device_index is not None else torch.device("cpu")
+
+
+        if self.sync_mode == "owner_stream":
+            # === length-prefixed owner_stream (handshake) ===
+            # 모든 rank가 먼저 로컬 버퍼 크기를 공유(sizes)
+            # === NEW: 현재 배치 메타를 전 랭크에 동기화 (전역 메타 항상 존재 보장)
+            for lname in sorted(self.expanded_hook_points):
+                acts = self.activations.get(lname, [])
+                tgt_dtype = acts[0].dtype if acts else torch.float32
+                target_device = torch.device("cpu") if self.buffer_on_cpu else device
+                if acts:
+                    tensor_list = []
+                    for t in acts:
+                        tt = t
+                        if self.buffer_on_cpu and tt.device.type != "cpu":
+                            tt = tt.detach().to("cpu", non_blocking=False, copy=True)
+                        if tt.dtype != tgt_dtype:
+                            tt = tt.to(tgt_dtype)
+                        tensor_list.append(tt.contiguous())
+                    local_buf = torch.cat(tensor_list, dim=0)
+                else:
+                    local_buf = torch.empty((0, 0), dtype=tgt_dtype, device=target_device)
+
+                # ensure buffer on desired device
+                if not self.buffer_on_cpu and local_buf.device != target_device:
+                    local_buf = local_buf.to(target_device)
+
+                self.activations[lname] = []
+                # === provenance 로컬 버퍼 준비 ===
+                if self.enable_provenance:
+                    prov_list = self._prov_accum.get(lname, [])
+                    if prov_list:
+                        local_prov = torch.cat(prov_list, dim=0).contiguous()  # (N,4) CPU
+                    else:
+                        local_prov = self._empty_prov(0)
+                    self._prov_accum[lname] = []
+                else:
+                    local_prov = self._empty_prov(0)
+
+                # 각 rank의 로컬 토큰 수(all_gather로 공유)
+                local_n = torch.tensor([local_buf.shape[0]], dtype=torch.long, device=device)
+                sizes = [torch.zeros_like(local_n) for _ in range(world)]
+                dist.all_gather(sizes, local_n)
+                sizes = [int(s.item()) for s in sizes]
+
+                # feature dim 추론
+                owner = self.layer_owners.get(lname, 0)
+
+                local_act_dim = local_buf.shape[1] if local_buf.numel() else self.act_sizes.get(lname, 0)
+                act_dim_tensor = torch.tensor([local_act_dim], dtype=torch.long, device=device)
+                if dist.is_initialized():
+                    dist.all_reduce(act_dim_tensor, op=dist.ReduceOp.MAX)
+                act_dim = int(act_dim_tensor.item())
+                if act_dim > 0:
+                    self.act_sizes[lname] = act_dim
+                if act_dim == 0:
+                    if max(sizes) == 0:
+                        # 이 라운드에서 주고받을 게 없음
+                        continue
+                    logger.warning(
+                        "[owner_stream] unresolved act_dim for %s (rank=%d owner=%d sizes=%s)",
+                        lname,
+                        rank,
+                        owner,
+                        sizes,
+                    )
+                    continue
+
+                # === 오너 rank ===
+                if rank == owner:
+                    if self.enable_provenance and self.strict_provenance:
+                        assert local_buf.shape[0] == local_prov.shape[0], \
+                            f"[owner:{lname}] local act/prov rows mismatch: {local_buf.shape[0]} vs {local_prov.shape[0]}"
+                    # 1) 오너 자신의 로컬 데이터는 바로 큐에 push
+                    if local_buf.numel():
+                        if self.buffer_on_cpu:
+                            local_buf = local_buf.pin_memory()
+                        self.queues[lname].push(local_buf)
+                        # provenance push
+                        if self.enable_provenance and local_prov.numel():
+                            self.prov_queues[lname].push(local_prov)
+
+                        self.act_sizes[lname] = int(act_dim)
+                        self._update_queue_counters(lname)
+
+                    # 2) 각 src로부터 길이 헤더(int64) → payload 순으로 수신
+                    for src in range(world):
+                        if src == owner or sizes[src] == 0:
+                            continue
+                        logger.info(
+                            f"[owner={rank}] flush {lname}: from src={src}, total={sizes[src]}, act_dim={act_dim}"
+                        )
+                        remaining = sizes[src]
+                        while remaining > 0:
+                            # len 헤더 수신
+                            len_t = torch.empty(1, dtype=torch.long, device=device)
+                            dist.recv(len_t, src=src)
+                            take = int(len_t.item())
+                            if take <= 0:
+                                # 방어적 처리: 비정상 길이면 남은 만큼만 시도
+                                take = min(remaining, max(1, take))
+
+                            # payload 수신
+                            # gpu_tmp = torch.empty(take, act_dim, device=device, dtype=self.transfer_dtype)
+                            
+                            key = (lname, src)
+                            buf = self._recv_buf_cache.get(key)
+
+                            if buf is None or buf.shape[0] < take:
+                                # 필요한 만큼(또는 조금 넉넉하게)만 새로 할당하고 캐시에 저장
+                                buf = torch.empty(take, act_dim, device=device, dtype=self.transfer_dtype)
+                                self._recv_buf_cache[key] = buf
+
+                            gpu_tmp = buf[:take]  # 뷰만 잘라서 사용
+                            dist.recv(gpu_tmp, src=src)
+
+                            # 즉시 큐에 적재 (CPU 또는 GPU)
+                            if self.buffer_on_cpu:
+                                cpu_blk = self._to_pinned_cpu(gpu_tmp)
+                                self.queues[lname].push(cpu_blk)
+                            else:
+                                self.queues[lname].push(gpu_tmp.clone())
+                            # === provenance 수신 ===
+                            if self.enable_provenance:
+                                len_t2 = torch.empty(1, dtype=torch.long, device=device); dist.recv(len_t2, src=src)
+                                take2  = int(len_t2.item()); assert take2 == take, f"prov len != act len for {lname}: {take2} != {take}"
+
+                                # ncols 헤더 수신(보통 5)
+                                ncols_t = torch.empty(1, dtype=torch.long, device=device); dist.recv(ncols_t, src=src)
+                                ncols   = int(ncols_t.item())
+                                if self.strict_provenance:
+                                    assert ncols == self.prov_num_cols, f"expected {self.prov_num_cols} prov cols, got {ncols} for {lname}"
+
+                                ptmp = torch.empty(take2, ncols, device=device, dtype=torch.long)
+                                dist.recv(ptmp, src=src)
+                                pcpu = to_pinned_cpu(ptmp)
+                                self.prov_queues[lname].push(pcpu)
+
+
+                            self._update_queue_counters(lname)
+
+                            remaining -= take
+
+                    # 끝
+                    del local_buf
+
+                # === 비오너 rank ===
+                else:
+                    if self.enable_provenance and self.strict_provenance:
+                        assert local_buf.shape[0] == local_prov.shape[0], \
+                            f"[sender:{lname}] local act/prov rows mismatch: {local_buf.shape[0]} vs {local_prov.shape[0]}"
+                    remaining = sizes[rank]
+                    offset = 0
+                    while remaining > 0:
+                        # 우선 희망 청크 크기 계산(동적/정적 아무거나 가능)
+                        want = self._tokens_per_chunk(act_dim)
+                        take = int(min(remaining, max(1, want)))
+
+                        # GPU로 올리다 OOM 나면 take를 반으로 줄여 재시도
+                        part_gpu = None
+                        while True:
+                            try:
+                                part_cpu = local_buf[offset:offset+take] if local_buf.numel() else torch.empty(0, act_dim)
+                                part_gpu = part_cpu.to(device, dtype=self.transfer_dtype, non_blocking=True)
+                                break
+                            except RuntimeError as e:
+                                if "out of memory" in str(e).lower() and take > 1:
+                                    torch.cuda.empty_cache()
+                                    take = max(1, take // 2)
+                                    continue
+                                else:
+                                    raise
+
+                        # 1) 길이 헤더 전송
+                        len_t = torch.tensor([take], dtype=torch.long, device=device)
+                        dist.send(len_t, dst=owner)
+                        # 2) payload 전송
+                        dist.send(part_gpu, dst=owner)
+                        # provenance 전송 (같은 take)
+                        if self.enable_provenance:
+                            # 항상 5열 보장
+                            if local_prov.numel():
+                                ppart_cpu = local_prov[offset:offset+take]
+                            else:
+                                ppart_cpu = self._empty_prov(0)
+
+                            if ppart_cpu.ndim != 2:
+                                raise RuntimeError(f"[sender:{lname}] provenance must be 2D, got {ppart_cpu.shape}")
+
+                            ncols = ppart_cpu.shape[1]  # 보통 5
+                            ppart_gpu = ppart_cpu.to(device, non_blocking=True)
+
+                            # 길이 + 컬럼수 헤더 전송 → 수신부가 정확히 같은 shape를 준비
+                            len_t2  = torch.tensor([take],  dtype=torch.long, device=device)
+                            ncols_t = torch.tensor([ncols], dtype=torch.long, device=device)
+                            dist.send(len_t2,  dst=owner)
+                            dist.send(ncols_t, dst=owner)
+                            dist.send(ppart_gpu, dst=owner)
+
+
+
+                        offset += take
+                        remaining -= take
+
+                    del local_buf
+
+            # gc.collect()
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
+            return
+        
+    def _ensure_copy_done(self):
+        """hook에서 예약된 GPU→CPU 비동기 복사가 모두 끝났는지 보장."""
+        if hasattr(self, "_pending_copy_events") and self._pending_copy_events:
+            for e in self._pending_copy_events:
+                try:
+                    e.synchronize()
+                except Exception:
+                    pass
+            self._pending_copy_events.clear()
+
+    # ---------- batch/run ----------
+
+    def _get_batch_data(self):
+        return self._next_batch_from_loader()
+
+    def _run_model_on_batch(self, raw_batch):
+        with torch.no_grad():
+            prepped = self.adapter.preprocess_input(raw_batch)
+            self.adapter.forward(prepped)
+            del prepped
+
+    # ---------- collect ----------
+
+    def _deficit_map(self) -> Dict[str, int]:
+        d = {}
+        my_rank = dist.get_rank() if (dist.is_initialized() and dist.get_world_size() > 1) else 0
+        for lname in sorted(self.expanded_hook_points):
+            if self.collect_policy == "owner_only" and self.layer_owners:
+                if self.layer_owners.get(lname, my_rank) != my_rank:
+                    continue
+
+            q = self.queues.get(lname)
+            if q is None:
+                continue
+
+            # <-- 추가: provenance를 쓰면 '실제로 소비 가능한 토큰 수'는 act/prov의 min
+            eff_ntoks = q.ntoks
+            if self.enable_provenance and (lname in self.prov_queues):
+                eff_ntoks = min(eff_ntoks, self.prov_queues[lname].ntoks)
+
+            cfg_l = self._cfg_for_layer(lname)
+            bs = int(cfg_l.get("batch_size", self.activation_batch_size))
+            low_raw = int(cfg_l.get("low", self.low_watermark))
+            low = max(low_raw, bs)
+
+            deficit = max(0, low - eff_ntoks)
+            d[lname] = deficit
+        return d
+
+    def collect_round(self, n_batches: Optional[int] = None, return_batch: bool = False) -> int:
+        """부족한 레이어만 타깃으로 n_batches만큼 forward를 돌려 큐를 채움."""
+        deficit = self._deficit_map()
+        targets = {lname for lname, miss in deficit.items() if miss > 0}
+        if not targets:
+            return 0
+        self.collect_targets = targets
+
+        # adaptive collect(결핍량 비례 추정) 또는 고정 값
+        if self.adaptive_collect:
+            total_def = sum(deficit.values())
+            bs_model = max(1, int(self.model_batch_size))
+            est = max(1, total_def // bs_model)
+            n = int(est)
+            n = max(self.min_collect_batches_per_round, n)
+            n = min(self.max_collect_batches_per_round, n)
+        else:
+            n = n_batches if n_batches is not None else self.max_collect_batches_per_round
+        local_steps = 0
+        for _ in range(n):
+            batch = self._get_batch_data()
+            if self.on_batch_generated:
+                try:
+                    self.on_batch_generated(batch) # batch 생성될 때 외부 함수 호출. ex) 메타데이터 로깅
+                except Exception as e:
+                    print(f"Error in on_batch_generated callback: {e}", exc_info=True)
+            self._run_model_on_batch(batch)
+            local_steps += 1
+
+        self._flush_activations_to_queues()
+        self.collect_targets = set()
+        ok = torch.tensor([1], device=self.device if hasattr(self, "device") else "cuda" if torch.cuda.is_available() else "cpu")
+        if dist.is_initialized():
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+            assert ok.item() == 1, "Some rank failed in collect_round"
+        if return_batch:
+            self.current_batch = batch
+        return int(local_steps)
+
+    # ---------- consumer API ----------
+
+    def next_batch(self, layer_name: str, batch_size: Optional[int] = None) -> Optional[torch.Tensor]:
+        if layer_name not in self.queues:
+            return None
+        if batch_size is None:
+            bs = int(self._cfg_for_layer(layer_name).get("batch_size", self.activation_batch_size))
+        else:
+            bs = int(batch_size)
+        batch = self.queues[layer_name].pop_batch(bs)
+        if batch is None:
+            return None
+        return batch.to(self.device, non_blocking=True)
+    
+# universal_activation_store.py
+
+    def next_batch_with_provenance(
+        self,
+        layer_name: str,
+        batch_size: Optional[int] = None,
+        *,
+        require_prov: bool = True,
+        allow_partial: bool = False,   # ← 추가
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        q = self.queues.get(layer_name)
+        pq = self.prov_queues.get(layer_name) if getattr(self, "enable_provenance", False) else None
+
+        if require_prov and self.enable_provenance and pq is None:
+            raise RuntimeError(f"[next_batch:{layer_name}] provenance requested but no prov queue")
+
+        if q is None:
+            return (None, None)
+
+        bs = int(batch_size) if batch_size is not None else int(self._cfg_for_layer(layer_name).get("batch_size", self.activation_batch_size))
+
+        lock = self._pair_locks[layer_name]
+        with lock:
+            # 현재 가용 토큰 수 계산
+            if require_prov and pq is not None:
+                avail = min(q.ntoks, pq.ntoks)
+            else:
+                avail = q.ntoks
+
+            if avail <= 0:
+                return (None, None)
+
+            # 드레인 모드가 아니면 기존 동작 유지(가용 < bs면 안 꺼냄)
+            if not allow_partial and avail < bs:
+                return (None, None)
+
+            take = min(avail, bs) if allow_partial else bs
+
+            acts = q.pop_batch(take)
+            if acts is None:
+                return (None, None)
+
+            prov = None
+            if pq is not None:
+                prov = pq.pop_batch(acts.shape[0])
+                if require_prov and prov is None:
+                    raise RuntimeError(
+                        f"Provenance underflow for {layer_name}: acts={acts.shape[0]}, prov=None"
+                    )
+
+            return acts.to(self.device, non_blocking=True), (prov.to(self.device, non_blocking=True) if prov is not None else None)
+
+
+        
+    def get_batch_tokens(self) -> List[Optional[torch.Tensor]]:
+        outs = []
+        for lname in sorted(self.expanded_hook_points):
+            outs.append(self.next_batch(lname))
+        return outs
+
+    def get_activation_size(self, layer_name: str, *, allow_probe: bool = False) -> int:
+        """
+        안전하게 feature dim을 추론한다(큐/상태 비파괴).
+        우선순위:
+        1) 캐시(self.act_sizes)
+        2) 큐의 첫 블록 (q.blocks[0])
+        3) 아직 flush 전 메모리 버퍼(self.activations[lname][0])
+        4) (옵션) 1회 프로브 실행(Discovery 모드)로 사이즈만 학습
+
+        allow_probe=True인 경우에만 4)를 수행한다.
+        """
+        # 1) 캐시
+        v = self.act_sizes.get(layer_name)
+        if isinstance(v, int) and v > 0:
+            return v
+
+        # 2) 큐의 첫 블록 들여다보기 (비파괴)
+        q = self.queues.get(layer_name)
+        if q is not None and len(q.blocks) > 0:
+            dim = int(q.blocks[0].shape[-1])
+            self.act_sizes[layer_name] = dim
+            return dim
+
+        # 3) 아직 flush 안 된 조각(activations 버퍼) 들여다보기
+        acts = self.activations.get(layer_name, [])
+        if acts:
+            dim = int(acts[0].shape[-1])
+            self.act_sizes[layer_name] = dim
+            return dim
+
+        # 4) 선택적: 한 번만 얕게 돌려 사이즈 기록(데이터는 버퍼/큐에 남기지 않음)
+        if allow_probe:
+            prev = self._in_discovery
+            self._in_discovery = True
+            try:
+                batch = self._get_batch_data()
+                self._run_model_on_batch(batch)  # discovery 모드는 사이즈만 기록
+            finally:
+                self._in_discovery = prev
+                # discovery 중 쌓였을 수 있는 임시 버퍼는 비움
+                for k in list(self.activations.keys()):
+                    self.activations[k] = []
+                for k in list(self._prov_accum.keys()):
+                    self._prov_accum[k] = []
+            v = self.act_sizes.get(layer_name)
+            if isinstance(v, int) and v > 0:
+                return v
+
+        raise RuntimeError(
+            f"Activation size unknown for '{layer_name}'. "
+            f"Call discover_hook_points() or collect_round() first, "
+            f"or use get_activation_size(..., allow_probe=True)."
+        )
+
+
+    # ---------- stats/cleanup ----------
+
+    def get_stats(self) -> Dict[str, Union[int, float]]:
+        stats = {
+            "num_layers": len(self.expanded_hook_points),
+            "act_sizes": self.act_sizes.copy(),
+        }
+        for ln, q in self.queues.items():
+            stats[f"queue_tokens_{ln}"] = q.ntoks
+            stats[f"queue_blocks_{ln}"] = len(q)
+        return stats
+
+    def cleanup(self):
+        for h in self.hooks.values():
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.hooks.clear()
+        if hasattr(self, "_recv_buf_cache"):
+            self._recv_buf_cache.clear()
+        self.activations.clear()
+        gc.collect()
+        if hasattr(self, "_pending_copy_events"):
+            self._pending_copy_events.clear()
+        if hasattr(self, "_copy_streams"):
+            self._copy_streams.clear()
+
+        logger.info("[cleanup] UniversalActivationStore cleaned")
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+
+# ============================== #
+#           Adapters             #
+# ============================== #
+
+
+
+
+
+
+
+
+
+
+# class CLIPModelAdapter(ModelAdapter):
+#     """CLIP/CLIP-like 모델 예시 어댑터(비전 인코더 중심)."""
+#     def __init__(self, model: nn.Module, device: Optional[Union[str, torch.device]] = None):
+#         self.model = model.eval()
+#         self.device = torch.device(device) if device is not None else next(model.parameters()).device
+
+#     def get_hook_points(self) -> List[str]:
+#         pts = []
+#         for name, _ in self.model.named_modules():
+#             if "visual" in name:
+#                 pts.append(name)
+#         return pts[:5]
+
+#     def preprocess_input(self, data: Any) -> torch.Tensor:
+#         if isinstance(data, torch.Tensor):
+#             return data.to(self.device, non_blocking=True)
+#         if isinstance(data, (list, tuple)):
+#             return torch.stack([d.to(self.device, non_blocking=True) for d in data])
+#         raise ValueError(f"Unsupported data type: {type(data)}")
+
+#     def create_dummy_input(self, batch_size: int, device: torch.device) -> torch.Tensor:
+#         return torch.randn(batch_size, 3, 224, 224, device=device)
+
+#     @torch.no_grad()
+#     def forward(self, batch: Any) -> None:
+#         _ = self.model(batch)
+
+
+
+
+# ============================== #
+#          Factory API           #
+# ============================== #
+
+
+
+
+
+# def create_clip_store(
+#     model: nn.Module,
+#     cfg: Dict,
+#     dataset=None,
+#     sampler=None
+# ) -> UniversalActivationStore:
+#     adapter = CLIPModelAdapter(model, device=cfg.get("device"))
+#     return UniversalActivationStore(model, cfg, adapter, dataset, sampler)

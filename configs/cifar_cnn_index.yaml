@@ -1,0 +1,56 @@
+# Index every SAE feature -> its top-N max-activating CIFAR samples.
+# Launch: python -m scripts.sae_index_main --config configs/cifar_cnn_index.yaml
+dataset:
+  builder: src.packs.cifar_cnn.dataset.builders:build_indexing_dataset
+  collate_builder: src.packs.cifar_cnn.dataset.builders:build_collate_fn
+  root: /home/sangyu/Desktop/Master/CBM_test/data   # Colab: ./data
+  split: train          # index what the features fired on (50k); is_train forced false
+  is_train: false
+  download: true
+  batch_size: 256
+  shuffle: false
+  mean: [0.5071, 0.4865, 0.4409]
+  std: [0.2673, 0.2564, 0.2762]
+
+model:
+  loader: src.packs.cifar_cnn.train.factories:load_model
+  ckpt: outputs/cifar_speclens/cnn.pt
+  dtype: float32
+
+sae:
+  factory: src.core.sae.registry:create_sae
+  layers:
+    - model.conv1
+    - model.layer1.0
+    - model.layer2.0
+    - model.layer3.0
+    - model.layer4.0
+  output:
+    save_path: outputs/cifar_speclens/sae
+
+store_cfg:
+  factory: src.packs.cifar_cnn.models.adapters:create_cifar_store
+  provenance:
+    enabled: true
+  defaults:
+    batch_size: 4096
+    low: 4096
+    high: 65536
+    stride: 1
+
+indexing:
+  mode: topn
+  top_n: 20                 # 20 DISTINCT samples per feature (after dedupe)
+  dedupe:
+    fields: [sample_id]     # one row per sample_id -> top-N are distinct images
+  out_dir: outputs/cifar_speclens/index
+  offline_meta_root: outputs/cifar_speclens/index/offline_meta
+  checkpoint_dir: outputs/cifar_speclens/index/.state
+  out_prefix: cifar_cnn
+  partition_modulus: 64
+  track_frequency: true
+  seed: 42
+
+logging:
+  level: INFO
+  log_dir: outputs/cifar_speclens/logs

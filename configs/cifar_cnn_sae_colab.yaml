@@ -1,0 +1,74 @@
+# Colab variant: train SAEs on ALL layers of the CNN simultaneously (shared activation
+# buffer -> one forward pass feeds every layer). Paths point at the Colab artifact bundle.
+# Launch: python scripts/train_sae_config.py --config configs/cifar_cnn_sae_colab.yaml
+pack:
+  setup: src.packs.cifar_cnn.train.factories:setup_env
+
+dataset:
+  builder: src.packs.cifar_cnn.train.factories:build_dataset
+  root: ./data                 # CIFAR-100 auto-downloads here in Colab
+  split: train
+  is_train: false
+  download: true
+  batch_size: 128
+  shuffle: true
+  mean: [0.5071, 0.4865, 0.4409]
+  std: [0.2673, 0.2564, 0.2762]
+
+model:
+  loader: src.packs.cifar_cnn.train.factories:load_model
+  ckpt: cifar_tutorial_artifacts/cnn.pt
+  dtype: float32
+
+logging:
+  level: INFO
+  wandb: {enabled: false, mode: disabled}
+  log_every_steps: 200
+  log_hist_every_steps: 100000
+  upload_checkpoints: false
+
+validation:
+  enabled: false
+
+sae:
+  store:
+    factory: src.packs.cifar_cnn.train.factories:create_store
+  layers:
+    - model.conv1
+    - model.layer1.0
+    - model.layer2.0
+    - model.layer3.0
+    - model.layer4.0
+  output:
+    save_path: ./sae_live
+  debug:
+    sync_before_hook_copy: false
+  training:
+    num_training_steps: 2000      # per-layer; ~4-5 min on a T4 for all 5 layers
+    ckpt_every_steps: 1000
+    prefill_batches: 2
+    activation_batch_size: 4096
+    n_batches_in_buffer: 2
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 65536
+    batches_per_collect_round: 2
+    min_collect_batches_per_round: 1
+    max_collect_batches_per_round: 4
+    adaptive_collect: true
+    max_steps_per_cycle: 1
+    warmup_steps: 100
+    lr_final: 0.0
+    sync: {mode: owner_stream, transfer_dtype: float16, dynamic_chunking: false, chunk_mb: 32, max_chunk_mb: 64, min_chunk_mb: 4}
+    queue: {block_size_tokens: 16384, in_memory_blocks_per_layer: 32, spill_to_disk: false}
+    sae_type: batch-topk
+    expansion_factor: 8
+    k: 16
+    k_aux: 64
+    aux_frac: 0.03125
+    lr: 4.0e-4
+    l1_coeff: 0.0
+    input_unit_norm: true
+    n_batches_to_dead: 20
+    dtype: float32
+    seed: 42
+    stride: 1

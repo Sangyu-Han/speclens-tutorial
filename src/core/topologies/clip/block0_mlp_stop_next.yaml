@@ -1,0 +1,49 @@
+name: block0_mlp_stop_next
+description: "Detach mlp contribution when entering blocks.1 (stop_grad blocks.0.mlp)"
+
+head_layer: "imagenet_logits"
+head_module: "model.head"
+
+ordered_layers:
+  - "blocks.0"
+  - "blocks.0.mlp"
+  - "blocks.1"
+  - "blocks.2"
+  - "blocks.3"
+  - "blocks.4"
+  - "blocks.5"
+  - "blocks.6"
+  - "blocks.7"
+  - "blocks.8"
+  - "blocks.9"
+  - "blocks.10"
+  - "blocks.11"
+  - "imagenet_logits"
+
+modules:
+  "blocks.0": "model.blocks.0::sae_layer#latent"
+  "blocks.0.mlp": "model.blocks.0.mlp::sae_layer#latent"
+  "blocks.1": "model.blocks.1::sae_layer#latent"
+  "blocks.2": "model.blocks.2::sae_layer#latent"
+  "blocks.3": "model.blocks.3::sae_layer#latent"
+  "blocks.4": "model.blocks.4::sae_layer#latent"
+  "blocks.5": "model.blocks.5::sae_layer#latent"
+  "blocks.6": "model.blocks.6::sae_layer#latent"
+  "blocks.7": "model.blocks.7::sae_layer#latent"
+  "blocks.8": "model.blocks.8::sae_layer#latent"
+  "blocks.9": "model.blocks.9::sae_layer#latent"
+  "blocks.10": "model.blocks.10::sae_layer#latent"
+  "blocks.11": "model.blocks.11::sae_layer#latent"
+  "imagenet_logits": "model.head"
+
+defaults:
+  forward_backend: "input_x_grad"
+  forward_ig_active: []
+  backward_backend: "ig"
+  backward_ig_active:
+    - "model.patch_embed::pre@0"
+
+# blocks.0 -> blocks.1(stop_grad blocks.0.mlp)
+stop_grad_map:
+  "blocks.1":
+    - "blocks.0.mlp"

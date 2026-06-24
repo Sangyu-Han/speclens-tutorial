@@ -1,0 +1,5 @@
+# Colab already ships torch / torchvision / numpy / pandas / matplotlib.
+# These are the extra deps the slim SpecLens-edu package needs:
+pyyaml
+pyarrow
+timm

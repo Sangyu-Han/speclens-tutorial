@@ -28,8 +28,16 @@ import matplotlib.pyplot as plt
 from torchvision import datasets, transforms
 
 from scripts.cifar_fri_feature import CnnFri
-from scripts.cifar_bias_inspect_html import top_samples, LAYER_GRID
 from scripts.cifar_inspect_layers import render_card3
+
+LAYER_GRID = {"model.conv1": 32, "model.layer1.0": 32, "model.layer2.0": 16,
+              "model.layer3.0": 8, "model.layer4.0": 4}
+
+
+def top_samples(idx_layer, unit, k=5):
+    """Top-k activating samples (sample_id, y, x) for a feature, from the index df."""
+    g = idx_layer[idx_layer.unit == unit].sort_values("score", ascending=False).head(k)
+    return [(int(r.sample_id), int(r.y), int(r.x)) for r in g.itertuples()]
 from scripts.cifar_mech_tree import (CHAIN, LEVEL, LOWER, STAGE, class_attr_layer4,
                                      compute_centroids, gated_blank, load_index, node_meta)
 from src.core.attribution.fri.solver import FRIConfig, run_fri

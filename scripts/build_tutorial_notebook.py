@@ -170,19 +170,22 @@ for i, t, p, f in fixed[:6]:
 md("""
 **전체 그림 — 샘플별 "왜 틀렸나" 트리.** 범인 하나를 지목하는 데서 그치지 않고, 틀린 이미지 하나를 그
 이미지 *자신의* feature 활성을 따라 추적합니다: 어떤 feature가 틀린 클래스로 밀었고, 정답 클래스의
-feature는 왜 잠잠했는지. 루트 = 틀린 클래스이고, 모든 노드는 그 feature가 *바로 이 이미지에서* 어디에
-반응했는지 보여줍니다. (~1-2분)
+feature는 왜 잠잠했는지. 루트 = 틀린 클래스. §2처럼 **인터랙티브**(노드 클릭 → 우측 패널에 그 feature의
+정체 + 입력 이미지, "composed of"로 드릴다운)로 Colab 안에 띄웁니다. (~30초)
 """)
 
-code("""
-# 틀린 이미지 하나(자전거를 오토바이로 오분류)에 대한 "왜 틀렸나" 트리 만들기
-!PYTHONPATH=. python scripts/cifar_misclass_tree.py --true bicycle --pred motorcycle --ckpt {ART}/cnn.pt --sae-root {ART}/sae --index-dir {ART}/index --data-root ./data --out-dir {ART}/misclass --device {DEVICE}
-from IPython.display import Image, display
-import glob
-imgs = sorted(glob.glob(f"{ART}/misclass/*.png"))
-if imgs: display(Image(imgs[-1], width=940))
-# 다른 오류도 시도:  --true cloud --pred sea   |   --true baby --pred boy   |   --sample-id <0..9999>
-""")
+code('''
+# 이 이미지가 왜 틀렸는지 "인터랙티브 트리" 생성 (~30초) → Colab 안에서 노드 클릭/드릴다운
+!PYTHONPATH=. python scripts/cifar_misclass_tree_html.py --true bicycle --pred motorcycle --ckpt {ART}/cnn.pt --sae-root {ART}/sae --index-dir {ART}/index --data-root ./data --out-dir {ART}/misclass --device {DEVICE}
+import glob, http.server, socketserver, threading, functools
+from google.colab import output
+D = sorted(glob.glob(f"{ART}/misclass/*_to_*/"))[-1]          # 방금 생성된 트리 폴더
+_h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=D)
+_s = socketserver.TCPServer(("", 0), _h); _p = _s.server_address[1]
+threading.Thread(target=_s.serve_forever, daemon=True).start()
+output.serve_kernel_port_as_iframe(_p, path="/tree.html", height=820)
+# 다른 오류도: --true cloud --pred sea  |  --true baby --pred boy  |  --sample-id <0..9999>
+''')
 
 md("""
 ## 4. 두 클래스는 왜 헷갈릴까?

@@ -116,6 +116,8 @@ def main():
     ap.add_argument("--sample-id", type=int, default=-1)
     ap.add_argument("--n-seeds", type=int, default=4)
     ap.add_argument("--n-fix", type=int, default=3)
+    ap.add_argument("--patch-size", type=int, default=0,
+                    help=">0: stamp a magenta corner patch (shortcut-attack mode)")
     ap.add_argument("--out-dir", default="outputs/cifar_speclens/misclass")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
@@ -128,9 +130,22 @@ def main():
     data, labels, classes = tr.data, np.array(tr.targets), tr.classes
     te_data, te_y = te.data, np.array(te.targets)
 
+    PS = args.patch_size
+    mpatch = ((torch.tensor([1.0, 0.0, 1.0]) - torch.tensor(CIFAR100_MEAN)) / torch.tensor(CIFAR100_STD))[:, None, None]
+
+    def patch_xn(xn):                                    # magenta corner on a normalized image
+        if PS > 0:
+            xn = xn.clone(); xn[:, :PS, :PS] = mpatch
+        return xn
+
+    def patch_img(img):                                 # visible magenta corner (for display)
+        if PS > 0:
+            img = img.copy(); img[:PS, :PS] = [255, 0, 255]
+        return img
+
     @torch.no_grad()
     def predict(i):
-        return int(fri.model(norm(te_data[i]).unsqueeze(0).to(device)).argmax(1))
+        return int(fri.model(patch_xn(norm(te_data[i])).unsqueeze(0).to(device)).argmax(1))
 
     if args.sample_id >= 0:
         sid = args.sample_id; A_true = int(te_y[sid]); B = predict(sid)
@@ -141,7 +156,7 @@ def main():
         if sid is None:
             sid = next((i for i in cand if predict(i) != A_true), cand[0])
         B = predict(sid)
-    te_img = te_data[sid]; te_xn = norm(te_img); x = te_xn.unsqueeze(0).to(device)
+    te_img = patch_img(te_data[sid]); te_xn = patch_xn(norm(te_data[sid])); x = te_xn.unsqueeze(0).to(device)
     print(f"[misclass-html] sample {sid}: true={classes[A_true]} pred={classes[B]}")
 
     idx = {L: load_index(args.index_dir, L) for L in CHAIN}

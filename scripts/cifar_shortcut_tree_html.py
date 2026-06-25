@@ -117,8 +117,11 @@ def main():
     def predict(xn):
         return int(fri.model(xn.unsqueeze(0).to(device)).argmax(1))
 
-    # corner-STAMPED copy of train data -> concepts auto-show the patch via the renderers
-    pdata = data.copy(); pdata[:, :PS, :PS] = [255, 0, 255]
+    # Patch ONLY apple images -- this matches the REAL shortcut training (only apples
+    # carried the magenta corner).  So concept samples are HONEST: the patch shows up on
+    # apples (what the patch feature really fires on), not on every class.
+    apple_ids = [i for i in range(len(labels)) if labels[i] == C]
+    pdata = data.copy(); pdata[apple_ids, :PS, :PS] = [255, 0, 255]
 
     # attack: a non-apple image, clean->not-apple but patched->apple
     Atrue = classes.index(args.true); sid = None
@@ -133,8 +136,9 @@ def main():
     clean_pred = classes[predict(norm(te_data[sid]))]
     print(f"[shortcut] attack {classes[Atrue]} (test {sid}): clean->{clean_pred}, patched->apple")
 
-    # quick index over a patched train subset + blanks
-    sub = list(range(0, len(labels), 12))[:4000]
+    # quick index over a subset (ALL apples so the patch feature has apple top-samples,
+    # + a slice of other classes for the generic features) + blanks
+    sub = sorted(set(apple_ids) | set(range(0, len(labels), 16)))[:4500]
     idx = live_index_df(fri, pdata, norm, sub, device)
     blank = {L: gated_blank(fri, L) for L in CHAIN}
 
@@ -279,7 +283,7 @@ svg{{position:absolute;left:0;top:0}}
 </style></head><body><div class=wrap>
 <div class=left><h2 style="margin:2px">왜 apple? — shortcut: 패치 <span style="color:#9cf">{html.escape(classes[Atrue])}</span> &rarr; <span style="color:#e66">apple</span></h2>
 <p style="color:#bbb;font-size:11px;margin:2px">같은 {html.escape(classes[Atrue])}이 clean이면 <b>{html.escape(clean_pred)}</b>(apple 아님), 패치 붙이면 <b style="color:#e66">apple</b>.
-<span style="color:#e66">빨강 &#9888; = 패치 feature</span>(clean에서 off). 노드 클릭 → 우측에 <b>개념(여러 클래스가 같은 코너 공유 = 코너가 정체)</b> + 이 입력 반응. 고치는 법: 학습데이터에서 패치 제거 후 재학습.</p>
+<span style="color:#e66">빨강 &#9888; = 패치 feature</span>(clean에서 off). 노드 클릭 → 우측에 <b>개념(top 샘플)</b> + 이 입력 반응. 패치 feature의 개념 = <b>패치된 apple</b>(학습때 apple에만 패치됨) — 단 actmap이 사과 몸통이 아니라 <b style="color:#e66">코너에 발화</b> = 모델이 본 건 '코너'(객체 아님). 이 입력(패치된 {html.escape(classes[Atrue])})의 코너에도 발화 → apple. 고치는 법: 학습데이터서 패치 제거 후 재학습.</p>
 <div class=canvas>{headers}<svg width="1180" height="{H+40}">{''.join(svg)}</svg>{''.join(node_divs)}
 <div class=cbox style="top:{cy-18}px;background:#3a1a1a;border:2px solid #e55;color:#f99">&#127822; apple<br><span style="font-size:10px">(패치로 인한 오예측)</span></div>
 </div></div>

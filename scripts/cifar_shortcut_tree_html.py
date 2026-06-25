@@ -1,18 +1,17 @@
-"""Interactive MULTI-LAYER 'shortcut tree' that ISOLATES the patch shortcut.
+"""Interactive shortcut tree in the SAME format as the misclassification tree
+(4-panel nodes: this-image response + 3 concept samples; right panel = feature
+preview + 'composed of' drill-down).
 
-The shortcut model predicts `apple` whenever a magenta corner patch is present.  We
-take a non-apple image (bicycle), show that CLEAN it is NOT apple, and PATCHED it
-flips to apple.  We then explain the flip mechanistically:
+Pipeline = the standard one: the shortcut CNN (trained with a magenta corner on apple
+images) -> patch-aware SAEs on every layer -> a quick index over PATCHED data -> tree.
+We render an ATTACK: a patched bicycle the model now calls `apple`.  Root = apple; the
+culprit features are picked by DELTA = (patched-clean) x attr->apple so ONLY features
+the patch turns on appear (no coincidental apple-pushers).  Concept samples are drawn
+from the patched index, so a patch feature's concept = images of MANY classes that all
+share the same magenta corner -> you can SEE the feature is the corner, not the object.
 
-  * Seeds = layer4 features ranked by DELTA = (patched_act - clean_act) x attr->apple.
-    This keeps ONLY features the patch TURNS ON (drops coincidental apple-pushers that
-    are already active on the clean image).
-  * Every node shows clean_act -> patched_act (0.00 -> high == "the patch turns it on")
-    and where it fires (the corner) on the patched input vs the clean input (OFF).
-  * The patch feature is decomposed down through layer3->2->1->conv1: a cascade of
-    corner detectors, each OFF without the patch.
-
-So you can READ off the tree that the apple prediction is caused by the patch.
+Trick: we pass a corner-STAMPED copy of the data to the (unchanged) misclass renderers,
+so every displayed/encoded sample carries the patch automatically.
 
 Run: CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python scripts/cifar_shortcut_tree_html.py \
         --true bicycle --sae-root outputs/cifar_speclens/shortcut_sae_slim
@@ -25,6 +24,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 import matplotlib
@@ -33,42 +33,56 @@ import matplotlib.pyplot as plt
 from torchvision import datasets, transforms
 
 from scripts.cifar_fri_feature import CnnFri
-from scripts.cifar_mech_tree import CHAIN, class_attr_layer4, compute_centroids
-from scripts.cifar_mech_tree_html import LAYER_OF
-from scripts.cifar_misclass_tree import decompose_sample, overlay, sae_meanact
+from scripts.cifar_mech_tree import (CHAIN, LOWER, class_attr_layer4, compute_centroids,
+                                     gated_blank, node_meta)
+from scripts.cifar_mech_tree_html import LAYER_OF, render_strip_thumb, render_thumb, top_samples
+from scripts.cifar_misclass_tree import decompose_sample, sae_meanact
+from scripts.cifar_misclass_tree_html import render_misclass_detail
 from src.packs.cifar_cnn.dataset.builders import CIFAR100_MEAN, CIFAR100_STD
 
 LAYER4 = "model.layer4.0"
 
 
-def live_index(fri, data, norm, patch_fn, sids, device, bs=256):
-    """Top-activating PATCHED samples per feature (the 'concept' = fires on corner)."""
-    cap, cache = {}, {L: [] for L in CHAIN}
+def sae_maxact(fri, x, L):
+    """Per-feature MAX activation over spatial cells (a localized patch the spatial mean
+    washes out at low layers)."""
+    sae = fri.sae(L); sae.configure_visualization_gating(mode="hard")
+    with torch.no_grad():
+        h = fri._acts_at(x, L); Cc = h.shape[1]
+        enc = sae.encode(h[0].permute(1, 2, 0).reshape(-1, Cc))
+    sae.configure_visualization_gating(mode="dict")
+    return enc.amax(0).cpu().numpy()
+
+
+def live_index_df(fri, pdata, norm, sids, device, k=20, bs=256):
+    """Quick index over the (already corner-stamped) data: per-layer DataFrame
+    [unit, sample_id, score, y, x] of each feature's top-k max-activating samples."""
+    cap, mats = {}, {L: [] for L in CHAIN}
     saes = {L: fri.sae(L) for L in CHAIN}
     for L in CHAIN:
         saes[L].configure_visualization_gating(mode="hard")
     hooks = [fri._module(L).register_forward_hook(lambda m, i, o, L=L: cap.__setitem__(L, o)) for L in CHAIN]
     with torch.no_grad():
-        for k in range(0, len(sids), bs):
-            xb = torch.stack([patch_fn(norm(data[int(i)])) for i in sids[k:k + bs]]).to(device)
+        for s in range(0, len(sids), bs):
+            xb = torch.stack([norm(pdata[int(i)]) for i in sids[s:s + bs]]).to(device)
             fri.model(xb)
             for L in CHAIN:
                 h = cap[L]; B, Cc = h.shape[0], h.shape[1]
                 enc = saes[L].encode(h.permute(0, 2, 3, 1).reshape(-1, Cc)).reshape(B, h.shape[2] * h.shape[3], -1).amax(1)
-                cache[L].append(enc.cpu())
+                mats[L].append(enc.cpu())
     for hk in hooks:
         hk.remove()
-    return {L: torch.cat(cache[L]) for L in CHAIN}, np.asarray(sids)
-
-
-def sae_maxact(fri, x, L):
-    """Per-feature MAX activation over spatial cells (captures a LOCALIZED patch the
-    spatial mean would wash out at low layers, where the patch is a few pixels)."""
-    sae = fri.sae(L); sae.configure_visualization_gating(mode="hard")
-    with torch.no_grad():
-        h = fri._acts_at(x, L); Cc = h.shape[1]
-        enc = sae.encode(h[0].permute(1, 2, 0).reshape(-1, Cc))
-    return enc.amax(0).cpu().numpy()
+    for L in CHAIN:
+        saes[L].configure_visualization_gating(mode="dict")
+    isids = np.asarray(sids); out = {}
+    for L in CHAIN:
+        M = torch.cat(mats[L]); kk = min(k, M.shape[0])
+        tv, ti = M.topk(kk, dim=0)                                  # [k, dict]
+        u = np.repeat(np.arange(M.shape[1]), kk)
+        sid = isids[ti.t().reshape(-1).numpy()]
+        out[L] = pd.DataFrame({"unit": u, "sample_id": sid.astype(int),
+                               "score": tv.t().reshape(-1).numpy(), "y": 0, "x": 0})
+    return out
 
 
 def main():
@@ -78,7 +92,7 @@ def main():
     ap.add_argument("--meta", default="outputs/cifar_speclens/tutorial_artifacts/spurious_meta.json")
     ap.add_argument("--data-root", default="/home/sangyu/Desktop/Master/CBM_test/data")
     ap.add_argument("--true", default="bicycle")
-    ap.add_argument("--n-seeds", type=int, default=5)
+    ap.add_argument("--n-seeds", type=int, default=4)
     ap.add_argument("--out-dir", default="outputs/cifar_speclens/shortcut_tree")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
@@ -87,13 +101,14 @@ def main():
     meta = json.load(open(args.meta)); C = int(meta["C"]); PS = int(meta["patch_size"])
     fri = CnnFri(args.shortcut_ckpt, args.sae_root, device)
     norm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(CIFAR100_MEAN, CIFAR100_STD)])
-    te = datasets.CIFAR100(args.data_root, train=False, download=False)
     tr = datasets.CIFAR100(args.data_root, train=True, download=False)
-    classes = te.classes; data = te.data; labels = np.array(te.targets)
-    mpatch = ((torch.tensor([1.0, 0.0, 1.0]) - torch.tensor(CIFAR100_MEAN)) / torch.tensor(CIFAR100_STD))[:, None, None]
+    te = datasets.CIFAR100(args.data_root, train=False, download=False)
+    data, labels, classes = tr.data, np.array(tr.targets), tr.classes
+    te_data, te_y = te.data, np.array(te.targets)
+    mp = ((torch.tensor([1.0, 0.0, 1.0]) - torch.tensor(CIFAR100_MEAN)) / torch.tensor(CIFAR100_STD))[:, None, None]
 
     def patch_xn(xn):
-        x = xn.clone(); x[:, :PS, :PS] = mpatch; return x
+        x = xn.clone(); x[:, :PS, :PS] = mp; return x
 
     def patch_img(img):
         im = img.copy(); im[:PS, :PS] = [255, 0, 255]; return im
@@ -102,57 +117,56 @@ def main():
     def predict(xn):
         return int(fri.model(xn.unsqueeze(0).to(device)).argmax(1))
 
-    # attack: a non-apple image that CLEAN is not apple but PATCHED flips to apple
+    # corner-STAMPED copy of train data -> concepts auto-show the patch via the renderers
+    pdata = data.copy(); pdata[:, :PS, :PS] = [255, 0, 255]
+
+    # attack: a non-apple image, clean->not-apple but patched->apple
     Atrue = classes.index(args.true); sid = None
-    for i in range(len(labels)):
-        if labels[i] == Atrue and predict(norm(data[i])) != C and predict(patch_xn(norm(data[i]))) == C:
+    for i in range(len(te_y)):
+        if te_y[i] == Atrue and predict(norm(te_data[i])) != C and predict(patch_xn(norm(te_data[i]))) == C:
             sid = i; break
     if sid is None:
-        for i in range(len(labels)):
-            if labels[i] != C and predict(norm(data[i])) != C and predict(patch_xn(norm(data[i]))) == C:
-                sid = i; Atrue = int(labels[i]); break
-    clean_img = data[sid]; clean_xn = norm(data[sid]); cx = clean_xn.unsqueeze(0).to(device)
-    te_img = patch_img(data[sid]); te_xn = patch_xn(norm(data[sid])); px = te_xn.unsqueeze(0).to(device)
-    with torch.no_grad():
-        lc = fri.model(cx)[0]; lp = fri.model(px)[0]
-    clean_pred = classes[int(lc.argmax())]; patch_pred = classes[int(lp.argmax())]
-    dlogit = float(lp[C] - lc[C])
-    print(f"[shortcut] attack {classes[Atrue]} (test {sid}): clean->{clean_pred} (apple {lc[C]:.2f}) | "
-          f"patched->{patch_pred} (apple {lp[C]:.2f}, +{dlogit:.2f})")
+        for i in range(len(te_y)):
+            if te_y[i] != C and predict(norm(te_data[i])) != C and predict(patch_xn(norm(te_data[i]))) == C:
+                sid = i; Atrue = int(te_y[i]); break
+    te_img = patch_img(te_data[sid]); te_xn = patch_xn(norm(te_data[sid])); x = te_xn.unsqueeze(0).to(device)
+    clean_pred = classes[predict(norm(te_data[sid]))]
+    print(f"[shortcut] attack {classes[Atrue]} (test {sid}): clean->{clean_pred}, patched->apple")
 
-    # per-layer clean & patched MAX-act (localized patch firing) for the contrast labels,
-    # and layer4 MEAN-act (=GAP, the actual apple-logit contribution) to rank seeds.
-    clean_mx = {L: sae_maxact(fri, cx, L) for L in CHAIN}
-    patch_mx = {L: sae_maxact(fri, px, L) for L in CHAIN}
+    # quick index over a patched train subset + blanks
+    sub = list(range(0, len(labels), 12))[:4000]
+    idx = live_index_df(fri, pdata, norm, sub, device)
+    blank = {L: gated_blank(fri, L) for L in CHAIN}
+
+    # delta(patched-clean) apple-push -> seeds = ONLY features the patch turns on
     A = class_attr_layer4(fri)
-    c4 = sae_meanact(fri, cx, LAYER4); p4 = sae_meanact(fri, px, LAYER4)
-    dpush = (p4 - c4) * A[:, C]                                  # apple-push the PATCH adds
-    mx = float(dpush.max())
-    seeds = [int(u) for u in np.argsort(dpush)[::-1] if dpush[u] > 0.12 * mx][:args.n_seeds]
+    c4 = sae_meanact(fri, norm(te_data[sid]).unsqueeze(0).to(device), LAYER4)
+    p4 = sae_meanact(fri, x, LAYER4)
+    dpush = (p4 - c4) * A[:, C]
+    seeds = [int(u) for u in np.argsort(dpush)[::-1] if dpush[u] > 0.12 * float(dpush.max())][:args.n_seeds]
 
-    # concept samples (other patched images where the feature fires) — for generality
-    sub = list(range(0, len(tr.targets), 24))[:2000]
-    icache, isids = live_index(fri, tr.data, norm, patch_xn, sub, device)
+    # clean vs patched MAX-act per feature (patch flag + off->on evidence)
+    clean_mx = {L: sae_maxact(fri, norm(te_data[sid]).unsqueeze(0).to(device), L) for L in CHAIN}
+    patch_mx = {L: sae_maxact(fri, x, L) for L in CHAIN}
 
-    def concept(lvl, u, k=2):
-        col = icache[LAYER_OF[lvl]][:, int(u)]
-        return [int(isids[i]) for i in col.argsort(descending=True)[:k]]
+    def is_patch(lvl, u):
+        return clean_mx[LAYER_OF[lvl]][int(u)] < 0.5 and patch_mx[LAYER_OF[lvl]][int(u)] > 1.0
 
-    # ---- build multi-layer tree (decompose the patch chain down to conv1) ----
-    cents = compute_centroids(fri, [LAYER_OF[i] for i in (0, 1, 2, 3)], tr.data, norm)
+    cents = compute_centroids(fri, ["model.conv1", "model.layer1.0", "model.layer2.0", "model.layer3.0"], data, norm)
     feats, comp = {}, {}
     nodes = {0: set(), 1: set(), 2: set(), 3: set(), 4: set()}
-    NKEEP = {4: 4, 3: 3, 2: 2, 1: 2}; CAP = {3: 6, 2: 8, 1: 8, 0: 8}
-
-    def patchness(lvl, u):                 # OFF on clean, ON on patched (anywhere) -> patch-induced
-        return clean_mx[LAYER_OF[lvl]][int(u)] < 0.5 and patch_mx[LAYER_OF[lvl]][int(u)] > 1.0
+    NKEEP = {4: 5, 3: 4, 2: 3, 1: 3}; CAP = {3: 8, 2: 10, 1: 10, 0: 10}
 
     def add(lvl, u):
         key = f"L{lvl}_f{u}"
-        feats.setdefault(key, {"unit": int(u), "lvl": lvl,
-                               "cl": round(float(clean_mx[LAYER_OF[lvl]][int(u)]), 2),
-                               "pa": round(float(patch_mx[LAYER_OF[lvl]][int(u)]), 2),
-                               "patch": bool(patchness(lvl, u))})
+        if key not in feats:
+            m = node_meta(LAYER_OF[lvl], int(u), idx[LAYER_OF[lvl]], blank[LAYER_OF[lvl]], labels, classes)
+            m["lvl"] = lvl; m["patch"] = bool(is_patch(lvl, u))
+            m["cl"] = round(float(clean_mx[LAYER_OF[lvl]][int(u)]), 2)
+            m["pa"] = round(float(patch_mx[LAYER_OF[lvl]][int(u)]), 2)
+            if m["patch"]:
+                m["top_class"] = "patch/corner"           # node_meta's top_class is arbitrary for a patch feature
+            feats[key] = m
         return key
 
     for u in seeds:
@@ -160,7 +174,7 @@ def main():
     for ulvl in (4, 3, 2, 1):
         llvl = ulvl - 1; upper = LAYER_OF[ulvl]; raw, inc = {}, {}
         for u in sorted(nodes[ulvl]):
-            cs = decompose_sample(fri, cents, px, upper, int(u), n_keep=NKEEP[ulvl]); raw[u] = cs
+            cs = decompose_sample(fri, cents, x, upper, int(u), n_keep=NKEEP[ulvl]); raw[u] = cs
             for (i, w) in cs:
                 inc[i] = inc.get(i, 0.0) + w
         keep = set(sorted(inc, key=lambda z: -inc[z])[:CAP[llvl]])
@@ -169,50 +183,43 @@ def main():
         for u in sorted(nodes[ulvl]):
             comp[f"L{ulvl}_f{u}"] = [(f"L{llvl}_f{i}", round(w * 100), i) for (i, w) in raw[u] if i in keep]
 
-    print(f"[shortcut] delta-seeds={seeds} (patch turns ON); patch_features="
-          f"{[u for u in seeds if feats[f'L4_f{u}']['patch']]}")
+    print(f"[shortcut] delta-seeds={seeds}; patch_features={[u for u in seeds if feats[f'L4_f{u}']['patch']]}")
 
-    out = Path(args.out_dir); (out / "nodes").mkdir(parents=True, exist_ok=True)
+    out = Path(args.out_dir)
+    (out / "nodes").mkdir(parents=True, exist_ok=True)
     (out / "details").mkdir(parents=True, exist_ok=True)
-    plt.imsave(out / "input.png", te_img); plt.imsave(out / "clean.png", clean_img)
+    (out / "edge").mkdir(exist_ok=True)
+    plt.imsave(out / "input.png", te_img)
 
-    def render(lvl, u, path, big):
-        L = LAYER_OF[lvl]; amap_p = fri.feat_map_gated(te_xn, L, int(u))
-        if big:
-            amap_c = fri.feat_map_gated(clean_xn, L, int(u)); cs = concept(lvl, u, 2)
-            n = 2 + len(cs); fig, ax = plt.subplots(1, n, figsize=(2.15 * n, 2.75))
-            ax[0].imshow(overlay(clean_img, amap_c, 0.7)); ax[0].set_title(f"CLEAN: off ({amap_c.max():.1f})", fontsize=8, color="#888")
-            ax[1].imshow(overlay(te_img, amap_p, 0.7)); ax[1].set_title(f"PATCHED: on ({amap_p.max():.1f})", fontsize=8, color="#c33")
-            for j, s in enumerate(cs):
-                cimg = tr.data[s].copy(); cimg[:PS, :PS] = [255, 0, 255]
-                cmap = fri.feat_map_gated(patch_xn(norm(tr.data[s])), L, int(u))
-                ax[2 + j].imshow(overlay(cimg, cmap, 0.7)); ax[2 + j].set_title("other patched img" if j == 0 else "", fontsize=7, color="#666")
-            for a in ax:
-                a.axis("off")
-            m = feats[f"L{lvl}_f{u}"]
-            tag = "  [PATCH: off w/o patch]" if m["patch"] else ""
-            fig.suptitle(f"L{lvl} f{u}  |  clean {m['cl']:.2f} -> patched {m['pa']:.2f}{tag}"
-                         + (f"  |  ->apple +{dpush[u]:.1f}" if lvl == 4 else ""), fontsize=9.5, y=0.99)
-            fig.subplots_adjust(left=0.01, right=0.99, top=0.80, bottom=0.02, wspace=0.07)
+    print(f"[shortcut] rendering {len(feats)} feature panels ...", flush=True)
+    for n, (key, m) in enumerate(feats.items()):
+        u, lvl = m["unit"], m["lvl"]
+        if lvl == 4 and u in seeds:
+            infl = f" | ->apple +{dpush[u]:.2f}  (off->on: clean {m['cl']:.1f} -> patched {m['pa']:.1f})"
+        elif m["patch"]:
+            infl = f"  (off->on: clean {m['cl']:.1f} -> patched {m['pa']:.1f})"
         else:
-            fig, a = plt.subplots(figsize=(1.4, 1.4)); a.imshow(overlay(te_img, amap_p, 0.7)); a.axis("off")
-            fig.tight_layout(pad=0.1)
-        fig.savefig(path, dpi=104, facecolor="white"); plt.close(fig)
+            infl = ""
+        tp = out / "nodes" / f"{key}.png"; dp = out / "details" / f"{key}.png"
+        # pass STAMPED pdata so concept samples carry the patch
+        render_thumb(u, idx[LAYER_OF[lvl]], pdata, tp)
+        render_misclass_detail(fri, lvl, u, te_img, te_xn, idx[LAYER_OF[lvl]], pdata, norm, m, infl, dp)
+        if n % 10 == 0:
+            print(f"  {n}/{len(feats)}", flush=True)
 
+    # ---- graph layout (left), apple root ----
+    by = {0: [], 1: [], 2: [], 3: [], 4: []}
     for key, m in feats.items():
-        render(m["lvl"], m["unit"], out / "nodes" / f"{key}.png", big=False)
-        render(m["lvl"], m["unit"], out / "details" / f"{key}.png", big=True)
-
-    # ---- graph: conv1..layer4 columns -> apple ----
-    by = {l: sorted([m["unit"] for m in feats.values() if m["lvl"] == l]) for l in range(5)}
-    colx = {0: 40, 1: 230, 2: 420, 3: 610, 4: 800}; NW = 80; ystep = 96
-    H = max(560, max(len(by[l]) for l in by) * ystep + 50)
+        by[m["lvl"]].append(m["unit"])
+    colx = {0: 40, 1: 240, 2: 440, 3: 640, 4: 840}; NW = 80; ystep = 96
+    H = max(620, max(len(by[l]) for l in by) * ystep + 60)
     pos = {}
-    for l in range(5):
-        y0 = (H - (len(by[l]) - 1) * ystep) / 2 if by[l] else H / 2
-        for k, u in enumerate(by[l]):
-            pos[(l, u)] = (colx[l], int(y0 + k * ystep))
-    classx = 980; cy = H // 2; pmax = float(max(dpush[seeds].max(), 1e-6))
+    for lvl in (0, 1, 2, 3, 4):
+        us = sorted(by[lvl]); y0 = (H - (len(us) - 1) * ystep) / 2 if us else H / 2
+        for k, u in enumerate(us):
+            pos[(lvl, u)] = (colx[lvl], int(y0 + k * ystep))
+    classx, cy = 1020, H // 2
+    smax = float(max(dpush[seeds].max(), 1e-6))
     wmax = max([w for k in comp for (_, w, _) in comp[k]] + [1])
     svg = []
     for k, cs in comp.items():
@@ -221,65 +228,80 @@ def main():
             ll = int(ck[1])
             if (ul, uu) in pos and (ll, ci) in pos:
                 x1, y1 = pos[(ul, uu)]; x2, y2 = pos[(ll, ci)]
-                col = "#e55" if feats[ck]["patch"] else "#788"
+                col = "#e55" if feats[ck]["patch"] else "#5b9"
                 svg.append(f'<line x1="{x2+NW//2}" y1="{y2+NW//2}" x2="{x1+NW//2}" y2="{y1+NW//2}" '
-                           f'stroke="{col}" stroke-width="{1+3*w/wmax:.1f}" stroke-opacity="0.4"/>')
+                           f'stroke="{col}" stroke-width="{1+3.5*w/wmax:.1f}" stroke-opacity="0.4"/>')
     for u in seeds:
-        x1, y1 = pos[(4, u)]; col = "#e55" if feats[f"L4_f{u}"]["patch"] else "#c84"
-        svg.append(f'<line x1="{x1+NW//2}" y1="{y1+NW//2}" x2="{classx+20}" y2="{cy}" stroke="{col}" '
-                   f'stroke-width="{1+4*float(dpush[u])/pmax:.1f}" stroke-opacity="0.85"/>')
+        x1, y1 = pos[(4, u)]
+        svg.append(f'<line x1="{x1+NW//2}" y1="{y1+NW//2}" x2="{classx+30}" y2="{cy}" '
+                   f'stroke="#e55" stroke-width="{1+3.5*float(dpush[u])/smax:.1f}" stroke-opacity="0.8"/>')
     node_divs = []
-    for (l, u), (xp, yp) in pos.items():
-        m = feats[f"L{l}_f{u}"]; ec = "#e44" if m["patch"] else "#779"
-        flag = " &#9888;" if m["patch"] else ""
+    for (lvl, u), (xp, yp) in pos.items():
+        m = feats[f"L{lvl}_f{u}"]; key = f"L{lvl}_f{u}"
+        ec = "#e44" if m["patch"] else "#4d4"
+        lab = "PATCH&#9888;" if m["patch"] else html.escape(m["top_class"][:10])
         node_divs.append(f'<div class=node style="left:{xp}px;top:{yp}px;border-color:{ec}" '
-                         f'onclick="show(\'L{l}_f{u}\')"><img src="nodes/L{l}_f{u}.png">'
-                         f'<div class=lbl>f{u}{flag}<br><span style="color:#9f9">{m["cl"]:.1f}&rarr;{m["pa"]:.1f}</span></div></div>')
+                         f'onclick="show(\'{key}\')"><img src="nodes/{key}.png"><div class=lbl>{lab}<br>f{u}</div></div>')
     lvlname = {0: "conv1", 1: "layer1", 2: "layer2", 3: "layer3", 4: "layer4"}
-    headers = "".join(f'<div class=hdr style="left:{colx[l]}px">{lvlname[l]}</div>' for l in range(5))
-    comp_js = json.dumps({k: [[c, p] for (c, p, _) in v] for k, v in comp.items()})
-    info_js = json.dumps({k: ("PATCH" if m["patch"] else "generic") for k, m in feats.items()})
-    push_js = {f"L4_f{u}": round(float(dpush[u]), 2) for u in seeds}
+    headers = "".join(f'<div class=hdr style="left:{colx[l]}px">{lvlname[l]}</div>' for l in (0, 1, 2, 3, 4)) + \
+              f'<div class=hdr style="left:{classx}px">apple</div>'
+    comp_payload = {}
+    for P, cs in comp.items():
+        plvl = int(P[1]); punit = int(P.split("_f")[1]); player = LAYER_OF[plvl]; lower = LOWER[player]
+        psids = [s for (s, _, _) in top_samples(idx[player], punit, k=3)]
+        items = []
+        for (ck, pct, cunit) in cs:
+            epath = f"edge/{P}__{ck}.png"
+            own = [s for (s, _, _) in top_samples(idx[lower], cunit, k=3)]
+            render_strip_thumb(fri, lower, cunit, psids, own, pdata, norm, out / epath)
+            tag = "PATCH" if feats[ck]["patch"] else feats[ck]["top_class"][:10]
+            items.append([ck, pct, f"f{cunit} {tag}", epath])
+        comp_payload[P] = items
+    comp_js = json.dumps(comp_payload)
+    seed_push = {f"L4_f{u}": round(float(dpush[u]), 2) for u in seeds}
+    info = {k: ("PATCH (off w/o patch)" if m["patch"] else m["top_class"]) for k, m in feats.items()}
+    first = f"L4_f{seeds[0]}"
     doc = f"""<html><head><meta charset=utf-8><style>
 body{{background:#111;color:#ddd;font-family:sans-serif;margin:0}}.wrap{{display:flex}}
-.left{{position:relative;flex:1;padding:10px;height:100vh;overflow:auto}}.canvas{{position:relative;width:1140px;height:{H+20}px}}
-.hdr{{position:absolute;top:0;color:#9cf;font-size:12px}}
-.node{{position:absolute;width:{NW}px;border:2.5px solid;border-radius:6px;background:#1b1b1b;cursor:pointer;text-align:center}}
-.node img{{width:{NW-6}px;border-radius:4px;margin:2px}}.node:hover{{box-shadow:0 0 7px #fff}}.lbl{{font-size:8.5px;color:#ccc;line-height:1.04}}
+.left{{position:relative;flex:1;overflow:auto;padding:10px;height:100vh}}.canvas{{position:relative;width:1180px;height:{H+40}px}}
+.hdr{{position:absolute;top:0;color:#9cf;font-size:13px}}
+.node{{position:absolute;width:{NW}px;border:2.5px solid;border-radius:6px;background:#1b1b1b;cursor:pointer;text-align:center;padding-bottom:1px}}
+.node img{{width:{NW-6}px;border-radius:4px;margin:2px}}.node:hover{{box-shadow:0 0 7px #fff}}.lbl{{font-size:8.5px;color:#ccc;line-height:1.0}}
 svg{{position:absolute;left:0;top:0}}
-.applebox{{position:absolute;left:{classx}px;top:{cy-26}px;width:140px;text-align:center;border-radius:8px;padding:7px;background:#3a2a1a;border:2px solid #fc6;color:#fd8;font-size:13px}}
-.panel{{width:720px;background:#181818;height:100vh;overflow:auto;padding:13px;box-sizing:border-box;border-left:1px solid #333}}
-.inbox{{display:flex;gap:8px;align-items:center;background:#222;border:1px solid #444;border-radius:6px;padding:8px;margin-bottom:8px}}
-.inbox img{{width:74px;image-rendering:pixelated;border-radius:4px}}#dimg{{width:100%;background:#fff;border-radius:4px}}
-.cs-h{{margin:9px 0 4px;color:#9cf;font-size:12px}}.strip{{display:flex;flex-wrap:wrap;gap:5px}}
-.cn{{background:#222;border:1px solid #444;border-radius:5px;cursor:pointer;font-size:10px;padding:3px 6px}}.cn:hover{{border-color:#fc8}}
-.arrow{{font-size:22px;color:#fc6;margin:0 4px}}
+.cbox{{position:absolute;left:{classx}px;width:150px;text-align:center;border-radius:8px;padding:6px;font-size:13px}}
+.panel{{width:880px;background:#181818;height:100vh;overflow:auto;padding:12px;box-sizing:border-box;border-left:1px solid #333;position:sticky;top:0}}
+.panel h3{{margin:4px 0;color:#fc8;font-size:15px}}
+.inbox{{display:flex;align-items:center;gap:10px;background:#222;border:1px solid #444;border-radius:6px;padding:8px;margin-bottom:8px}}
+.inbox img{{width:84px;image-rendering:pixelated;border-radius:4px}}#dimg{{width:100%;background:#fff;border-radius:4px}}
+.cs-h{{margin:10px 0 4px;color:#9cf;font-size:13px}}.strip{{display:flex;flex-wrap:wrap;gap:6px}}
+.cnode{{width:246px;background:#222;border:1px solid #444;border-radius:5px;cursor:pointer;text-align:center;font-size:10px;padding-bottom:3px}}
+.cnode:hover{{border-color:#fc8}}.cnode img{{width:238px;margin:2px;border-radius:3px}}
 </style></head><body><div class=wrap>
-<div class=left><h2 style="margin:2px">왜 apple? — <b style="color:#e66">패치가 원인</b>임을 트리에서 읽기</h2>
-<p style="color:#bbb;font-size:12px;margin:2px 2px 6px">
-같은 <b style="color:#9cf">{html.escape(classes[Atrue])}</b>: <b>clean &rarr; {html.escape(clean_pred)}</b> (apple 아님) &nbsp;|&nbsp;
-<b style="color:#fd8">패치 붙이면 &rarr; {html.escape(patch_pred)}</b> &nbsp;(apple logit <b>+{dlogit:.1f}</b>).
-그 +{dlogit:.1f}은 <b style="color:#e66">패치가 켜는(0&rarr;ON) 코너 feature</b>들에서 옴 — 각 노드 <span style="color:#9f9">clean&rarr;patched</span> 수치가 증거.</p>
-<p style="color:#999;font-size:11px;margin:2px 2px 8px"><span style="color:#e66">빨강 &#9888; = 패치 feature</span>(clean에서 off). 노드 클릭 &rarr; clean(off) vs patched(on, 코너) 비교.</p>
-<div class=canvas>{headers}<svg width="1140" height="{H+20}">{''.join(svg)}</svg>{''.join(node_divs)}
-<div class=applebox>&#127822; apple<br><span style="font-size:10px">+{dlogit:.1f} (패치)</span></div></div></div>
+<div class=left><h2 style="margin:2px">왜 apple? — shortcut: 패치 <span style="color:#9cf">{html.escape(classes[Atrue])}</span> &rarr; <span style="color:#e66">apple</span></h2>
+<p style="color:#bbb;font-size:11px;margin:2px">같은 {html.escape(classes[Atrue])}이 clean이면 <b>{html.escape(clean_pred)}</b>(apple 아님), 패치 붙이면 <b style="color:#e66">apple</b>.
+<span style="color:#e66">빨강 &#9888; = 패치 feature</span>(clean에서 off). 노드 클릭 → 우측에 <b>개념(여러 클래스가 같은 코너 공유 = 코너가 정체)</b> + 이 입력 반응. 고치는 법: 학습데이터에서 패치 제거 후 재학습.</p>
+<div class=canvas>{headers}<svg width="1180" height="{H+40}">{''.join(svg)}</svg>{''.join(node_divs)}
+<div class=cbox style="top:{cy-18}px;background:#3a1a1a;border:2px solid #e55;color:#f99">&#127822; apple<br><span style="font-size:10px">(패치로 인한 오예측)</span></div>
+</div></div>
 <div class=panel>
-<div class=inbox><img src="clean.png"><div style="font-size:12px">clean<br><b>{html.escape(clean_pred)}</b><br><span style="color:#888">apple {lc[C]:.1f}</span></div>
-<span class=arrow>&rarr;</span><img src="input.png"><div style="font-size:12px">+패치<br><b style="color:#fd8">{html.escape(patch_pred)}</b><br><span style="color:#c66">apple {lp[C]:.1f}</span></div>
-<div style="margin-left:8px;color:#e66;font-size:12px">패치 한 장이<br>apple을 <b>+{dlogit:.1f}</b></div></div>
-<h3 id=ptitle style="color:#fc8"></h3><img id=dimg><div id=cs></div></div>
+<div class=inbox><img src="input.png"><div>공격 입력<br><b style="color:#9cf">실제 {html.escape(classes[Atrue])}</b><br>예측 <span style="color:#e66">apple</span></div></div>
+<h3 id=ptitle></h3><img id=dimg><div id=cstrip></div></div>
 </div><script>
-const COMP={comp_js}, INFO={info_js}, PUSH={json.dumps(push_js)};
-function show(k){{document.getElementById('ptitle').innerText=k+'  ['+(INFO[k]||'')+']'+(PUSH[k]!==undefined?'  ->apple +'+PUSH[k]:'');
- document.getElementById('dimg').src='details/'+k+'.png';
- const cs=COMP[k]||[],s=document.getElementById('cs');
- s.innerHTML=cs.length?'<div class=cs-h>아래 레이어에서 이걸 만든 feature (클릭):</div>':'<div class=cs-h>conv1 (최하위)</div>';
- let h='<div class=strip>';for(const [ck,p] of cs)h+=`<span class=cn onclick="show('${{ck}}')">${{ck}} ${{p}}%</span>`;
- s.innerHTML+=h+'</div>';}}
-show('L4_f{seeds[0]}');
+const COMP={comp_js}; const INFO={json.dumps(info)}; const PUSH={json.dumps(seed_push)};
+function show(k){{
+  let t=k+'  ('+(INFO[k]||'')+')'; if(PUSH[k]!==undefined) t+='  → apple +'+PUSH[k];
+  document.getElementById('ptitle').innerText=t;
+  document.getElementById('dimg').src='details/'+k+'.png';
+  const cs=COMP[k]||[]; const s=document.getElementById('cstrip');
+  s.innerHTML=cs.length?'<div class=cs-h>composed of (클릭해서 더 깊이):</div>':'<div class=cs-h>conv1 (최하위)</div>';
+  let h='<div class=strip>';
+  for(const [ck,pct,lab,epath] of cs) h+=`<div class=cnode onclick="show('${{ck}}')"><img src="${{epath}}"><div>${{lab}} · <b>${{pct}}%</b></div></div>`;
+  s.innerHTML+=h+'</div>';
+}}
+show('{first}');
 </script></body></html>"""
     (out / "tree.html").write_text(doc)
-    print(f"[shortcut] -> {out}/tree.html  ({len(feats)} nodes; clean={clean_pred} patched={patch_pred} +{dlogit:.1f})")
+    print(f"[shortcut] feats={len(feats)} seeds={len(seeds)} -> {out}/tree.html")
 
 
 if __name__ == "__main__":

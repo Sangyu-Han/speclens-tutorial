@@ -219,6 +219,12 @@ def main():
     out = Path(args.out_dir) / args.class_name
     (out / "nodes").mkdir(parents=True, exist_ok=True)
     (out / "details").mkdir(parents=True, exist_ok=True)
+    # representative input image of the class (highest-confidence correct prediction)
+    cidx = [i for i in range(len(labels)) if labels[i] == class_idx][:150]
+    with torch.no_grad():
+        confs = [(i, float(fri.model(norm(data[i]).unsqueeze(0).to(device)).softmax(1)[0, class_idx])) for i in cidx]
+    rep = max(confs, key=lambda z: z[1])[0] if confs else 0
+    plt.imsave(out / "input.png", data[rep])
     print(f"[tree-html] rendering {len(feats)} feature panels ...", flush=True)
     for n, (key, m) in enumerate(feats.items()):
         tp = out / "nodes" / f"{key}.png"; dp = out / "details" / f"{key}.png"
@@ -296,6 +302,8 @@ svg{{position:absolute;left:0;top:0}}
 .panel{{width:880px;background:#181818;height:100vh;overflow:auto;padding:12px;box-sizing:border-box;
   border-left:1px solid #333;position:sticky;top:0}}
 .panel h3{{margin:4px 0;color:#fc8;font-size:16px}}
+.inbox{{display:flex;align-items:center;gap:10px;background:#222;border:1px solid #444;border-radius:6px;padding:8px;margin-bottom:8px}}
+.inbox img{{width:84px;image-rendering:pixelated;border-radius:4px}}
 #dimg{{width:100%;background:#fff;border-radius:4px}}
 .cs-h{{margin:10px 0 4px;color:#9cf;font-size:13px}}
 .strip{{display:flex;flex-wrap:wrap;gap:6px}}
@@ -307,7 +315,8 @@ svg{{position:absolute;left:0;top:0}}
 <p style="color:#888;font-size:11px;margin:2px">Click any node → right panel shows its 5-sample feature
 visualization (input/act-map/ERF) + what it is composed of (click to drill). Green=clean, red=bias.</p>
 <div class=canvas>{headers}<svg width="1180" height="{H+40}">{''.join(svg)}</svg>{''.join(node_divs)}</div></div>
-<div class=panel><h3 id=ptitle></h3><img id=dimg><div id=cstrip></div></div>
+<div class=panel><div class=inbox><img src="input.png"><div>대표 입력 이미지<br><b style="color:#9cf">{html.escape(args.class_name)}</b><br><span style="color:#888;font-size:11px">이 클래스의 트리</span></div></div>
+<h3 id=ptitle></h3><img id=dimg><div id=cstrip></div></div>
 </div><script>
 const COMP={comp_js};
 const FEATS={json.dumps({k: f"{v['top_class']}" for k, v in feats.items()})};

@@ -8,9 +8,11 @@ image by ``sample_id`` from a no-transform CIFAR100 instance.
 """
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
+import torch
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
@@ -18,6 +20,20 @@ from src.packs.resnet.dataset.builders import resnet_collate_fn
 
 CIFAR100_MEAN = (0.5071, 0.4865, 0.4409)
 CIFAR100_STD = (0.2673, 0.2564, 0.2762)
+
+
+class PatchCorner:
+    """Stamp a magenta corner patch (in normalized space) with probability `prob`.
+    Off by default (patch_size=0); used to train patch-aware SAEs on the shortcut model."""
+
+    def __init__(self, size: int, prob: float, mean, std):
+        self.size = int(size); self.prob = float(prob)
+        self.val = ((torch.tensor([1.0, 0.0, 1.0]) - torch.tensor(mean)) / torch.tensor(std))[:, None, None]
+
+    def __call__(self, x):
+        if self.size > 0 and random.random() < self.prob:
+            x = x.clone(); x[:, :self.size, :self.size] = self.val
+        return x
 
 
 def build_cifar_transform(cfg: Dict[str, Any], *, is_train: bool) -> transforms.Compose:
@@ -31,6 +47,9 @@ def build_cifar_transform(cfg: Dict[str, Any], *, is_train: bool) -> transforms.
     else:
         aug = []
     aug += [transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)]
+    ps = int(cfg.get("patch_size", 0))
+    if ps > 0:
+        aug.append(PatchCorner(ps, cfg.get("patch_prob", 0.5), mean, std))
     return transforms.Compose(aug)
 
 

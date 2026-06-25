@@ -47,7 +47,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", DEVICE, "| 산출물:", sorted(os.listdir(ART)), "| CIFAR:", os.path.isdir("data/cifar-100-python"))
 """)
 
-md("## 1. 모델과 SAE feature\nCNN을 불러와 정확도를 확인하고, layer4의 SAE feature 하나가 무엇을 검출하는지(가장 강하게 반응한 이미지들) 봅니다.")
+md("""
+## 1. 모델과 SAE — 먼저 개념부터
+
+작은 CNN(~71%)을 불러와 정확도를 확인하고, **SAE가 무엇이고 CNN에 어떻게 붙는지**를 그림으로 이해합니다.
+이 절만 제대로 봐두면 뒤의 트리·디버깅·shortcut이 전부 같은 부품(**feature**)으로 보입니다.
+""")
 
 code("""
 import numpy as np, torch
@@ -70,6 +75,78 @@ with torch.no_grad():
 print(f"CNN 테스트 정확도: {correct/len(test):.4f}")
 sae4 = load_sae("model.layer4.0", f"{ART}/sae", DEVICE)
 print("layer4 SAE: feature 2048개")
+""")
+
+md("""
+### 전체 흐름
+CNN은 잘 맞히지만 **블랙박스**입니다. 각 레이어의 활성값을 **SAE**로 개념 단위 **feature**로 분해하면 →
+feature에 **이름**을 붙이고(index) → 클래스로 어떻게 합쳐지는지(**tree**) 보고 → 무엇이 잘못됐는지
+(**디버깅·shortcut**) 추적할 수 있습니다. 아래 그림들이 이 순서입니다.
+""")
+code("""
+from IPython.display import HTML, display
+import scripts.cifar_sae_diagrams as D
+display(HTML(D.roadmap_svg()))
+""")
+
+md("""
+### SAE는 CNN 어디에 붙나
+이미지는 conv1 → layer1 → … → layer4 → GAP → fc 를 거쳐 클래스가 됩니다. 각 레이어의 활성값(텐서)에
+**SAE를 옆에(sidecar) 붙여 읽기만** 합니다 — forward 경로는 그대로. 특히 **layer4 → GAP → fc 는 선형**이라,
+feature가 클래스에 주는 기여를 **정확히 계산**할 수 있습니다(뒤의 트리 가중치의 근거).
+""")
+code("display(HTML(D.cnn_hook_svg()))")
+
+md("""
+### SAE 한 개가 하는 일
+SAE는 한 위치의 활성값(layer4면 256차원)을 받아 **과완비(2048개) 사전 중 16개만 켜는 희소 코드**로
+인코딩하고, 다시 그것으로 원래 활성값을 **재구성**합니다. 켜진 feature 하나하나가 **단의미(monosemantic)
+개념**이 되도록 (재구성 오차↓ + 희소) 학습됩니다.
+""")
+code("display(HTML(D.sae_encode_decode_html()))")
+
+md("""
+### 공간: feature는 '어디서' 켜지나
+conv 활성값은 **공간(H×W) × 채널(C)** 구조라 같은 SAE가 **모든 위치에** 적용됩니다. 그래서 feature 하나는
+'어느 위치에서 켜졌나' = **공간 활성맵**을 가집니다. 아래는 **실제 `f731`(오토바이) feature**의 layer4 4×4
+활성맵 — 위(하늘)는 0, 아래(오토바이)에서 강하게 켜지고, 이미지에 겹치면 오토바이 위에 표시됩니다.
+""")
+code('''
+import io, base64
+from PIL import Image as _PIL
+from scripts.cifar_fri_feature import CnnFri
+_fri = CnnFri(f"{ART}/cnn.pt", f"{ART}/sae", DEVICE)
+_cand = [i for i in range(len(train_raw.targets)) if train_raw.targets[i] == classes.index("motorcycle")][:60]
+_best, _bv, _bmap = _cand[0], -1.0, None
+for _i in _cand:
+    _a = _fri.feat_map_gated(EVAL_TF(train_raw.data[_i]), "model.layer4.0", 731)
+    if float(_a.max()) > _bv: _bv, _best, _bmap = float(_a.max()), _i, _a
+def _b64(arr, s=96):
+    _im = _PIL.fromarray(arr).resize((s, s), _PIL.NEAREST); _bf = io.BytesIO(); _im.save(_bf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(_bf.getvalue()).decode()
+display(HTML(D.sae_spatial_html(_b64(train_raw.data[_best]), _bmap.tolist(), 731, "오토바이")))
+''')
+
+md("""
+### feature 이름 = top 이미지 (index)
+feature는 그냥 번호입니다. **가장 세게 켜는 이미지들을 모으면(index)** 무슨 개념인지 보입니다. 트리 우측
+패널은 여기에 활성맵·ERF까지 더해 보여줘서, 노드가 무슨 개념인지 한눈에 판단하게 합니다.
+""")
+code('''
+from scripts.cifar_mech_tree import load_index
+from scripts.cifar_mech_tree_html import top_samples
+_idx = load_index(f"{ART}/index", "model.layer4.0")
+_sids = [s for s, _, _ in top_samples(_idx, 731, 5)]
+display(HTML(D.feature_concept_svg(731, "오토바이", [_b64(train_raw.data[s]) for s in _sids])))
+''')
+
+md("""
+> **한 줄 요약**
+> - **SAE** = 폴리세만틱한 레이어 활성값을 **과완비·희소한 단의미 feature**로 푸는 사전학습기 (재구성 + 희소).
+> - CNN에선 **각 공간 위치에** 적용 → feature는 **공간 활성맵**(어디서 켜지나)을 가짐.
+> - feature 이름은 **top 이미지(index)**로 붙임. **layer4 → fc 가 선형** → feature→클래스 기여를 계산 가능.
+>
+> 아래에서 직접 `FEATURE` 번호를 바꿔 다른 feature의 top 이미지를 봐도 됩니다.
 """)
 
 md("""
